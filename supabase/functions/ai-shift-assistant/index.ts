@@ -8,6 +8,8 @@ const corsHeaders = {
 };
 
 const GEMINI_MODEL = "gemini-2.5-flash";
+const AI_CHAT_WINDOW_SECONDS = 60;
+const AI_CHAT_MAX_REQUESTS_PER_WINDOW = 12;
 const CONFIRM_PHRASES = ["xác nhận", "dong y", "đồng ý", "ok", "oke", "confirm", "thực hiện"];
 const CANCEL_PHRASES = ["hủy", "huy", "không", "khong", "cancel", "thôi", "dừng"];
 
@@ -44,6 +46,41 @@ function jsonResponse(body: Record<string, unknown>, status = 200) {
     status,
     headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
+}
+
+async function enforceAiChatRateLimit(
+  supabaseAdmin: ReturnType<typeof createClient>,
+  userId: string,
+  message: string,
+) {
+  const windowStartIso = new Date(Date.now() - AI_CHAT_WINDOW_SECONDS * 1000).toISOString();
+
+  const { count, error: countError } = await supabaseAdmin
+    .from("ai_chat_rate_limits")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .gte("created_at", windowStartIso);
+
+  if (countError) {
+    throw new Error(`Rate limit check failed: ${countError.message}`);
+  }
+
+  if ((count || 0) >= AI_CHAT_MAX_REQUESTS_PER_WINDOW) {
+    return { allowed: false };
+  }
+
+  const { error: insertError } = await supabaseAdmin
+    .from("ai_chat_rate_limits")
+    .insert({
+      user_id: userId,
+      message_preview: message.slice(0, 200),
+    });
+
+  if (insertError) {
+    throw new Error(`Rate limit write failed: ${insertError.message}`);
+  }
+
+  return { allowed: true };
 }
 
 function normalizeText(text: string) {
@@ -653,6 +690,13 @@ serve(async (req) => {
     const safeMessages = Array.isArray(messages) ? messages as ChatMessage[] : [];
     const currentMessage = latestUserMessage(safeMessages);
     const today = new Date().toISOString().split("T")[0];
+
+    const rateLimit = await enforceAiChatRateLimit(supabaseAdmin, user.id, currentMessage);
+    if (!rateLimit.allowed) {
+      return jsonResponse({
+        error: `Báº¡n gá»­i yÃªu cáº§u quÃ¡ nhanh. Vui lÃ²ng Ä‘á»£i khoáº£ng ${AI_CHAT_WINDOW_SECONDS} giÃ¢y rá»“i thá»­ láº¡i.`,
+      }, 429);
+    }
 
     const geminiApiKey = Deno.env.get("GEMINI_API_KEY");
     if (!geminiApiKey) {

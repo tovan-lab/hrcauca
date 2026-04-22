@@ -16,6 +16,7 @@ dist-ssr
 !.env.example
 *.csv
 *.sql
+!supabase/migrations/*.sql
 supabase/.temp/
 
 # Editor directories and files
