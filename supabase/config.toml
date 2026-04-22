@@ -1,6 +1,8 @@
 project_id = "qlvxhnljtxlscwwshofn"
 
 [functions]
+  [functions.ai-shift-assistant]
+    verify_jwt = false
   [functions.auth-email-hook]
     verify_jwt = false
   [functions.process-email-queue]
