@@ -6,6 +6,9 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type",
 };
 
+const ADMIN_CREATE_WINDOW_SECONDS = 300;
+const ADMIN_CREATE_MAX_REQUESTS = 10;
+
 type CreateUserPayload = {
   email?: string;
   password?: string;
@@ -13,6 +16,38 @@ type CreateUserPayload = {
   role?: "EMPLOYEE" | "HR" | "ADMIN";
   branch_id?: string | null;
 };
+
+async function enforceAdminActionRateLimit(
+  admin: ReturnType<typeof createClient>,
+  userId: string,
+  actionKey: string,
+  targetHint: string,
+  limit: number,
+  windowSeconds: number,
+) {
+  const windowStartIso = new Date(Date.now() - windowSeconds * 1000).toISOString();
+
+  const { count, error: countError } = await admin
+    .from("admin_action_rate_limits")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .eq("action_key", actionKey)
+    .gte("created_at", windowStartIso);
+
+  if (countError) return { ok: false, status: 500, error: `Rate limit check failed: ${countError.message}` };
+  if ((count || 0) >= limit) return { ok: false, status: 429, error: "Bạn thao tác quá nhanh. Vui lòng thử lại sau vài phút." };
+
+  const { error: insertError } = await admin
+    .from("admin_action_rate_limits")
+    .insert({
+      user_id: userId,
+      action_key: actionKey,
+      target_hint: targetHint.slice(0, 200),
+    });
+
+  if (insertError) return { ok: false, status: 500, error: `Rate limit write failed: ${insertError.message}` };
+  return { ok: true, status: 200, error: "" };
+}
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -25,14 +60,14 @@ Deno.serve(async (req) => {
       return json({ error: "Unauthorized" }, 401);
     }
 
-    const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-    const ANON = Deno.env.get("SUPABASE_ANON_KEY")!;
-    const SERVICE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+    const anonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-    const callerClient = createClient(SUPABASE_URL, ANON, {
+    const callerClient = createClient(supabaseUrl, anonKey, {
       global: { headers: { Authorization: authHeader } },
     });
-    const admin = createClient(SUPABASE_URL, SERVICE);
+    const admin = createClient(supabaseUrl, serviceRoleKey);
 
     const token = authHeader.replace("Bearer ", "");
     const { data: claims, error: claimsErr } = await callerClient.auth.getClaims(token);
@@ -64,6 +99,18 @@ Deno.serve(async (req) => {
       return json({ error: "Mật khẩu phải có ít nhất 6 ký tự" }, 400);
     }
 
+    const rateLimit = await enforceAdminActionRateLimit(
+      admin,
+      callerId,
+      "admin_create_user",
+      email,
+      ADMIN_CREATE_MAX_REQUESTS,
+      ADMIN_CREATE_WINDOW_SECONDS,
+    );
+    if (!rateLimit.ok) {
+      return json({ error: rateLimit.error }, rateLimit.status);
+    }
+
     let callerBranchId: string | null = null;
     if (!roleSet.has("ADMIN")) {
       const { data: callerProfile } = await admin
@@ -74,7 +121,7 @@ Deno.serve(async (req) => {
       callerBranchId = callerProfile?.branch_id ?? null;
 
       if (targetRole === "ADMIN") {
-        return json({ error: "HR không được tạo tài khoản HR" }, 403);
+        return json({ error: "HR không được tạo tài khoản ADMIN" }, 403);
       }
       if (targetBranchId !== null && targetBranchId !== callerBranchId) {
         return json({ error: "HR chỉ được tạo nhân viên trong chi nhánh của mình" }, 403);
@@ -86,9 +133,7 @@ Deno.serve(async (req) => {
     let existingUserId: string | null = null;
     for (let page = 1; page < 50; page++) {
       const { data, error } = await admin.auth.admin.listUsers({ page, perPage: 200 });
-      if (error) {
-        return json({ error: error.message }, 500);
-      }
+      if (error) return json({ error: error.message }, 500);
       const found = data.users.find((u) => (u.email ?? "").toLowerCase() === email);
       if (found) {
         existingUserId = found.id;

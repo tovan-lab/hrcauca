@@ -1,7 +1,3 @@
-// Edge function: xóa user khỏi auth.users (chỉ ADMIN/HR)
-// Hỗ trợ 2 mode:
-//   - by_email: dọn user mồ côi (không có profile) — chỉ cần email
-//   - by_user_id: xóa hẳn 1 nhân viên đang tồn tại (có profile)
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.74.0";
 
 const corsHeaders = {
@@ -9,6 +5,41 @@ const corsHeaders = {
   "Access-Control-Allow-Headers":
     "authorization, x-client-info, apikey, content-type",
 };
+
+const ADMIN_DELETE_WINDOW_SECONDS = 300;
+const ADMIN_DELETE_MAX_REQUESTS = 10;
+
+async function enforceAdminActionRateLimit(
+  admin: ReturnType<typeof createClient>,
+  userId: string,
+  actionKey: string,
+  targetHint: string,
+  limit: number,
+  windowSeconds: number,
+) {
+  const windowStartIso = new Date(Date.now() - windowSeconds * 1000).toISOString();
+
+  const { count, error: countError } = await admin
+    .from("admin_action_rate_limits")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .eq("action_key", actionKey)
+    .gte("created_at", windowStartIso);
+
+  if (countError) return { ok: false, status: 500, error: `Rate limit check failed: ${countError.message}` };
+  if ((count || 0) >= limit) return { ok: false, status: 429, error: "Bạn thao tác quá nhanh. Vui lòng thử lại sau vài phút." };
+
+  const { error: insertError } = await admin
+    .from("admin_action_rate_limits")
+    .insert({
+      user_id: userId,
+      action_key: actionKey,
+      target_hint: targetHint.slice(0, 200),
+    });
+
+  if (insertError) return { ok: false, status: 500, error: `Rate limit write failed: ${insertError.message}` };
+  return { ok: true, status: 200, error: "" };
+}
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -21,12 +52,11 @@ Deno.serve(async (req) => {
       return json({ error: "Unauthorized" }, 401);
     }
 
-    const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-    const ANON = Deno.env.get("SUPABASE_ANON_KEY")!;
-    const SERVICE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+    const anonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-    // Client với JWT của caller — để xác thực và check role
-    const userClient = createClient(SUPABASE_URL, ANON, {
+    const userClient = createClient(supabaseUrl, anonKey, {
       global: { headers: { Authorization: authHeader } },
     });
 
@@ -37,26 +67,35 @@ Deno.serve(async (req) => {
     }
     const callerId = claims.claims.sub as string;
 
-    // Check role: phải là ADMIN hoặc HR
-    const admin = createClient(SUPABASE_URL, SERVICE);
+    const admin = createClient(supabaseUrl, serviceRoleKey);
     const { data: roles } = await admin
       .from("user_roles")
       .select("role")
       .eq("user_id", callerId);
     const roleSet = new Set((roles ?? []).map((r: any) => r.role));
     if (!roleSet.has("ADMIN") && !roleSet.has("HR")) {
-      return json({ error: "Forbidden — chỉ ADMIN/HR mới được dọn user" }, 403);
+      return json({ error: "Forbidden - chỉ ADMIN/HR mới được dọn user" }, 403);
     }
 
     const body = await req.json().catch(() => ({}));
     const { email, user_id } = body as { email?: string; user_id?: string };
 
+    const rateLimit = await enforceAdminActionRateLimit(
+      admin,
+      callerId,
+      "admin_delete_user",
+      email || user_id || "",
+      ADMIN_DELETE_MAX_REQUESTS,
+      ADMIN_DELETE_WINDOW_SECONDS,
+    );
+    if (!rateLimit.ok) {
+      return json({ error: rateLimit.error }, rateLimit.status);
+    }
+
     let targetUserId: string | null = user_id ?? null;
 
-    // Mode 1: tìm theo email (dùng cho user mồ côi)
     if (!targetUserId && email) {
       const normalized = String(email).trim().toLowerCase();
-      // Duyệt qua admin.listUsers (paginated)
       let page = 1;
       while (page < 50) {
         const { data, error } = await admin.auth.admin.listUsers({ page, perPage: 200 });
@@ -78,7 +117,6 @@ Deno.serve(async (req) => {
       return json({ error: "Thiếu email hoặc user_id" }, 400);
     }
 
-    // HR chỉ được xóa user trong cùng chi nhánh (nếu user đó có profile)
     if (!roleSet.has("ADMIN") && roleSet.has("HR")) {
       const { data: callerProfile } = await admin
         .from("profiles")
@@ -90,17 +128,15 @@ Deno.serve(async (req) => {
         .select("branch_id")
         .eq("user_id", targetUserId)
         .maybeSingle();
-      // Nếu target có profile → phải cùng chi nhánh. Nếu mồ côi (không profile) → cho phép.
+
       if (targetProfile && targetProfile.branch_id !== callerProfile?.branch_id) {
         return json({ error: "Bạn không có quyền xóa nhân viên ngoài chi nhánh của mình." }, 403);
       }
-      // Không cho HR (Quản lý) tự xóa chính mình
       if (targetUserId === callerId) {
         return json({ error: "Không thể tự xóa tài khoản của chính mình." }, 400);
       }
     }
 
-    // Dọn dữ liệu liên quan trước (để không bị orphan)
     await Promise.all([
       admin.from("check_ins").delete().eq("user_id", targetUserId),
       admin.from("shifts").delete().eq("user_id", targetUserId),
@@ -112,15 +148,14 @@ Deno.serve(async (req) => {
     ]);
     await admin.from("profiles").delete().eq("user_id", targetUserId);
 
-    // Cuối cùng: xóa khỏi auth.users
-    const { error: delErr } = await admin.auth.admin.deleteUser(targetUserId);
-    if (delErr) {
-      return json({ error: `Xóa khỏi auth.users thất bại: ${delErr.message}` }, 500);
+    const { error: deleteError } = await admin.auth.admin.deleteUser(targetUserId);
+    if (deleteError) {
+      return json({ error: `Xóa khỏi auth.users thất bại: ${deleteError.message}` }, 500);
     }
 
     return json({ success: true, deleted_user_id: targetUserId });
-  } catch (e: any) {
-    return json({ error: e?.message ?? String(e) }, 500);
+  } catch (error: any) {
+    return json({ error: error?.message ?? String(error) }, 500);
   }
 });
 
