@@ -42,6 +42,18 @@ type MutationPayload = {
   };
 };
 
+type EvaluationPayload = {
+  employee_name: string;
+  employee_id: string;
+  evaluation_date: string;
+  categories_scores: Record<string, Record<string, number>>;
+  feedback_events: string[];
+  bonus_score: number;
+  manager_comment: string;
+  total_score: number;
+  branch_id: string | null;
+};
+
 type ChatAuditPayload = {
   conversationId: string;
   userId: string;
@@ -53,6 +65,59 @@ type ChatAuditPayload = {
   mutationsApplied: boolean;
   metadata?: Record<string, unknown>;
 };
+
+const EVALUATION_CATEGORIES = [
+  {
+    key: "thai_do",
+    label: "Thái độ & tác phong",
+    criteria: [
+      { key: "than_thien", label: "Thân thiện, chào hỏi", max: 10 },
+      { key: "khong_thai_do", label: "Không thái độ, không cãi khách", max: 10 },
+      { key: "ton_trong", label: "Tôn trọng đồng nghiệp", max: 5 },
+    ],
+  },
+  {
+    key: "ky_nang",
+    label: "Kỹ năng phục vụ",
+    criteria: [
+      { key: "ghi_order", label: "Ghi order chính xác", max: 10 },
+      { key: "hieu_menu", label: "Hiểu menu, tư vấn", max: 5 },
+      { key: "dung_quy_trinh", label: "Đúng quy trình phục vụ", max: 5 },
+    ],
+  },
+  {
+    key: "toc_do",
+    label: "Tốc độ & hiệu suất",
+    criteria: [
+      { key: "phuc_vu_nhanh", label: "Phục vụ nhanh, không để khách chờ", max: 10 },
+      { key: "quan_ly_ban", label: "Quản lý nhiều bàn tốt", max: 10 },
+    ],
+  },
+  {
+    key: "tuan_thu",
+    label: "Tuân thủ quy định",
+    criteria: [
+      { key: "dong_phuc", label: "Đồng phục", max: 5 },
+      { key: "khong_dien_thoai", label: "Không dùng điện thoại", max: 5 },
+      { key: "khong_tu_tap", label: "Không tụ tập", max: 5 },
+    ],
+  },
+  {
+    key: "tinh_than",
+    label: "Tinh thần làm việc",
+    criteria: [
+      { key: "chu_dong", label: "Chủ động", max: 5 },
+      { key: "ho_tro", label: "Hỗ trợ đồng đội", max: 5 },
+    ],
+  },
+] as const;
+
+const FEEDBACK_EVENTS = [
+  { key: "khach_khen", label: "khách khen", points: 10 },
+  { key: "nhac_nhe", label: "nhắc nhở", points: -5 },
+  { key: "phan_nan_truc_tiep", label: "phàn nàn trực tiếp", points: -10 },
+  { key: "phan_nan_quan_ly", label: "phàn nàn lên quản lý", points: -20 },
+] as const;
 
 type OpenAIFunctionCall = {
   id?: string;
@@ -339,7 +404,7 @@ const queryTool = {
       properties: {
         query_type: {
           type: "string",
-          enum: ["shifts", "attendance", "evaluations", "employees", "branches"],
+          enum: ["shifts", "attendance", "evaluations", "employees", "branches", "monthly_summary"],
         },
         date: { type: "string" },
         date_from: { type: "string" },
@@ -463,26 +528,153 @@ function inferDateFromMessage(message: string, today: string) {
   return today;
 }
 
+function getMonthRange(date: string) {
+  const baseDate = new Date(`${date}T00:00:00`);
+  const year = baseDate.getUTCFullYear();
+  const month = baseDate.getUTCMonth();
+  const start = new Date(Date.UTC(year, month, 1));
+  const end = new Date(Date.UTC(year, month + 1, 0));
+
+  return {
+    start: start.toISOString().slice(0, 10),
+    end: end.toISOString().slice(0, 10),
+  };
+}
+
+function calculateShiftHours(startTime?: string | null, endTime?: string | null) {
+  if (!startTime || !endTime) return 0;
+
+  const [startHour, startMinute] = startTime.split(":").map((value) => Number(value || 0));
+  const [endHour, endMinute] = endTime.split(":").map((value) => Number(value || 0));
+
+  let startTotalMinutes = startHour * 60 + startMinute;
+  let endTotalMinutes = endHour * 60 + endMinute;
+  if (endTotalMinutes <= startTotalMinutes) endTotalMinutes += 24 * 60;
+
+  return Math.max(0, (endTotalMinutes - startTotalMinutes) / 60);
+}
+
+function getFlatEvaluationCriteria() {
+  return EVALUATION_CATEGORIES.flatMap((category) =>
+    category.criteria.map((criterion) => ({
+      categoryKey: category.key,
+      categoryLabel: category.label,
+      criterionKey: criterion.key,
+      criterionLabel: criterion.label,
+      max: criterion.max,
+    }))
+  );
+}
+
+function buildInitialEvaluationScores() {
+  return Object.fromEntries(
+    EVALUATION_CATEGORIES.map((category) => [
+      category.key,
+      Object.fromEntries(category.criteria.map((criterion) => [criterion.key, 0])),
+    ]),
+  );
+}
+
+function extractNumericScore(message: string) {
+  const match = normalizeText(message).match(/\b(\d{1,3})\b/);
+  return match ? Number(match[1]) : null;
+}
+
+function isYesMessage(message: string) {
+  const normalized = normalizeText(message);
+  return ["co", "có", "yes", "y", "ok"].some((item) => normalized === normalizeText(item) || normalized.includes(normalizeText(item)));
+}
+
+function isNoMessage(message: string) {
+  const normalized = normalizeText(message);
+  return ["khong", "không", "ko", "kh", "no"].some((item) => normalized === normalizeText(item) || normalized.includes(normalizeText(item)));
+}
+
+function hasActiveEvaluationPrompt(messages: ChatMessage[]) {
+  const lastAssistant = previousAssistantMessage(messages);
+  const normalized = normalizeText(lastAssistant);
+  return (
+    normalized.includes("anh muon cham diem cho ai") ||
+    normalized.includes("dang cham diem cho") ||
+    normalized.includes("phan diem co ban da xong") ||
+    normalized.includes("ca nay co doanh thu tren 100 trieu khong") ||
+    normalized.includes("hay nhap nhan xet quan ly cho")
+  );
+}
+
+function shouldUseDeterministicFallback(message: string, messages: ChatMessage[]) {
+  const normalized = normalizeText(message);
+  const refersToPriorContext =
+    normalized.includes("ca do") ||
+    normalized.includes("nguoi do") ||
+    normalized.includes("ban do") ||
+    normalized.includes("ca nay");
+  const mentionsMutation =
+    normalized.includes("xoa") ||
+    normalized.includes("huy") ||
+    normalized.includes("sua") ||
+    normalized.includes("doi") ||
+    normalized.includes("them ca") ||
+    normalized.includes("xep ca");
+  const startsEvaluation =
+    normalized.includes("cham diem") ||
+    normalized.includes("chấm điểm") ||
+    normalized.includes("danh gia nhan vien") ||
+    normalized.includes("đánh giá nhân viên");
+
+  return hasActiveEvaluationPrompt(messages) || startsEvaluation || (refersToPriorContext && mentionsMutation);
+}
+
 function inferEmployeeNameFromMessage(message: string) {
   const trimmedMessage = message.trim();
+  const stopTokens = [
+    "hôm nay",
+    "ngày mai",
+    "ngày",
+    "trong hôm nay",
+    "trong ngày",
+    "từ",
+    "lúc",
+    "ca",
+    "chi nhánh",
+    "nghỉ",
+    "xóa",
+    "xoa",
+    "hủy",
+    "huy",
+    "sửa",
+    "sua",
+    "đổi",
+    "doi",
+    "cho tôi",
+    "giúp tôi",
+    "dùm tôi",
+  ];
 
-  const explicitEmployee = message.match(/nhân viên\s+(.+?)(?:\s+hôm nay|\s+ngày|\s+từ|\s+lúc|\s+ca|\s+chi nhánh|\?|$)/i);
-  if (explicitEmployee?.[1]) {
-    const candidate = explicitEmployee[1].trim();
-    if (isLikelyEmployeeName(candidate)) return candidate;
-  }
+  const cleanupCandidate = (rawCandidate?: string | null) => {
+    if (!rawCandidate) return undefined;
+    let candidate = rawCandidate.trim();
+    for (const token of stopTokens) {
+      const index = normalizeText(candidate).indexOf(normalizeText(token));
+      if (index > 0) {
+        candidate = candidate.slice(0, index).trim();
+      }
+    }
+    candidate = candidate.replace(/[,.!?]+$/g, "").trim();
+    return isLikelyEmployeeName(candidate) ? candidate : undefined;
+  };
 
-  const forPerson = message.match(/cho\s+(.+?)(?:\s+hôm nay|\s+ngày|\s+từ|\s+lúc|\s+ca|\?|$)/i);
-  if (forPerson?.[1]) {
-    const candidate = forPerson[1].trim();
-    if (isLikelyEmployeeName(candidate)) return candidate;
-  }
+  const explicitEmployee = message.match(/nhân viên\s+(.+)/i);
+  const explicitCandidate = cleanupCandidate(explicitEmployee?.[1]);
+  if (explicitCandidate) return explicitCandidate;
 
-  const ofPerson = message.match(/của\s+(.+?)(?:\s+hôm nay|\s+ngày|\s+từ|\s+lúc|\s+ca|\?|$)/i);
-  if (ofPerson?.[1]) {
-    const candidate = ofPerson[1].trim();
-    if (isLikelyEmployeeName(candidate)) return candidate;
-  }
+  const forPerson = message.match(/cho\s+(.+)/i);
+  const forCandidate = cleanupCandidate(forPerson?.[1]);
+  if (forCandidate) return forCandidate;
+
+  const ofPerson = message.match(/của\s+(.+)/i);
+  const ofCandidate = cleanupCandidate(ofPerson?.[1]);
+  if (ofCandidate) return ofCandidate;
 
   const trailingName = message.match(/(?:cho tôi|giúp tôi|dùm tôi|đi)\s+([A-Za-zÀ-ỹ][A-Za-zÀ-ỹ\s]{1,60})$/i);
   if (trailingName?.[1]) {
@@ -528,6 +720,11 @@ function isLikelyEmployeeName(candidate: string) {
     "dum toi",
     "sua ca",
     "doi ca",
+    "nghi",
+    "trong hom nay",
+    "trong ngay",
+    "xoa ca",
+    "huy ca",
   ];
 
   if (blockedPhrases.some((phrase) => normalized === phrase || normalized.includes(`${phrase} `) || normalized.endsWith(` ${phrase}`))) {
@@ -576,6 +773,11 @@ function inferEmployeeNameFromAssistantContext(messages: ChatMessage[]) {
     const singleShiftMatch = content.match(/cho:\s+\*\*(.+?)\*\*/i);
     if (singleShiftMatch?.[1] && isLikelyEmployeeName(singleShiftMatch[1].trim())) {
       return singleShiftMatch[1].trim();
+    }
+
+    const singleListMatch = content.match(/1\.\s+(.+?)(?:\s+-\s+\d{4}-\d{2}-\d{2}|\s+\(\d{2}:\d{2}-\d{2}:\d{2}\)|$)/i);
+    if (singleListMatch?.[1] && isLikelyEmployeeName(singleListMatch[1].trim())) {
+      return singleListMatch[1].trim();
     }
   }
 
@@ -646,11 +848,15 @@ function mergeWithPreviousMutation(
   return {
     action: current.action,
     date: current.date || previous.date,
-    employee_names: current.employee_names.length > 0 ? current.employee_names : previous.employee_names,
+    employee_names: current.employee_names.length > 0
+      ? current.employee_names
+      : patch?.employee_names?.length
+      ? patch.employee_names
+      : previous.employee_names,
     shift_details: {
-      start_time: current.shift_details?.start_time || previous.shift_details?.start_time,
-      end_time: current.shift_details?.end_time || previous.shift_details?.end_time,
-      shift_type: current.shift_details?.shift_type || previous.shift_details?.shift_type || "FULL_TIME_8H",
+      start_time: current.shift_details?.start_time || patch?.shift_details?.start_time || previous.shift_details?.start_time,
+      end_time: current.shift_details?.end_time || patch?.shift_details?.end_time || previous.shift_details?.end_time,
+      shift_type: current.shift_details?.shift_type || patch?.shift_details?.shift_type || previous.shift_details?.shift_type || "FULL_TIME_8H",
     },
   };
 }
@@ -667,6 +873,7 @@ async function executeQuery(
   const dateTo = args.date_to as string | undefined;
   const branchId = args.branch_id as string | undefined;
   const employeeName = args.employee_name as string | undefined;
+  const referenceDate = date || dateFrom || new Date().toISOString().slice(0, 10);
 
   const { data: branchList } = await supabaseAdmin.from("branches").select("id, branch_name");
   const branchMap = Object.fromEntries((branchList || []).map((b: any) => [b.id, b.branch_name]));
@@ -812,11 +1019,171 @@ async function executeQuery(
       employee_count: counts.get(branch.id) || 0,
     }));
 
-    if (callerRole === "HR" && callerBranchId) {
-      result = result.filter((branch: any) => branch.id === callerBranchId);
+    return { count: result.length, data: result };
+  }
+
+  if (queryType === "monthly_summary") {
+    const range = getMonthRange(referenceDate);
+
+    const { data: shiftRows } = await supabaseAdmin
+      .from("shifts")
+      .select("user_id, shift_date, start_time, end_time, actual_branch_id")
+      .gte("shift_date", range.start)
+      .lte("shift_date", range.end);
+
+    const { data: evaluationRows } = await supabaseAdmin
+      .from("evaluations")
+      .select("employee_id, total_score, evaluation_date, branch_id")
+      .gte("evaluation_date", range.start)
+      .lte("evaluation_date", range.end);
+
+    const editMonthKey = range.start.slice(0, 7);
+    const { data: penaltyRows } = await supabaseAdmin
+      .from("shift_edit_logs")
+      .select("employee_id, edit_count, penalty_amount, edit_month")
+      .eq("edit_month", editMonthKey);
+
+    const { data: attendanceRows } = await supabaseAdmin
+      .from("check_ins")
+      .select("user_id, late_minutes, early_leave_minutes, branch_id, check_in_time")
+      .gte("check_in_time", `${range.start}T00:00:00`)
+      .lt("check_in_time", `${range.end}T23:59:59`);
+
+    const userIds = [
+      ...new Set([
+        ...((shiftRows || []).map((row: any) => row.user_id)),
+        ...((evaluationRows || []).map((row: any) => row.employee_id)),
+        ...((penaltyRows || []).map((row: any) => row.employee_id)),
+        ...((attendanceRows || []).map((row: any) => row.user_id)),
+      ]),
+    ];
+
+    const { data: profiles } = userIds.length > 0
+      ? await supabaseAdmin.from("profiles").select("user_id, name, branch_id").in("user_id", userIds)
+      : { data: [] as any[] };
+
+    const profileMap = Object.fromEntries((profiles || []).map((profile: any) => [profile.user_id, profile]));
+
+    const filteredShifts = (shiftRows || []).filter((row: any) => {
+      const profile = profileMap[row.user_id] || {};
+      const resolvedBranchId = row.actual_branch_id || profile.branch_id || null;
+      if (callerRole === "HR" && callerBranchId && resolvedBranchId !== callerBranchId) return false;
+      if (branchId && resolvedBranchId !== branchId) return false;
+      return true;
+    });
+
+    const filteredEvaluations = (evaluationRows || []).filter((row: any) => {
+      const profile = profileMap[row.employee_id] || {};
+      const resolvedBranchId = row.branch_id || profile.branch_id || null;
+      if (callerRole === "HR" && callerBranchId && resolvedBranchId !== callerBranchId) return false;
+      if (branchId && resolvedBranchId !== branchId) return false;
+      return true;
+    });
+
+    const filteredPenalties = (penaltyRows || []).filter((row: any) => {
+      const profile = profileMap[row.employee_id] || {};
+      const resolvedBranchId = profile.branch_id || null;
+      if (callerRole === "HR" && callerBranchId && resolvedBranchId !== callerBranchId) return false;
+      if (branchId && resolvedBranchId !== branchId) return false;
+      return true;
+    });
+
+    const filteredAttendance = (attendanceRows || []).filter((row: any) => {
+      const profile = profileMap[row.user_id] || {};
+      const resolvedBranchId = row.branch_id || profile.branch_id || null;
+      if (callerRole === "HR" && callerBranchId && resolvedBranchId !== callerBranchId) return false;
+      if (branchId && resolvedBranchId !== branchId) return false;
+      return true;
+    });
+
+    const shiftHoursByUser = new Map<string, number>();
+    const shiftCountByUser = new Map<string, number>();
+
+    for (const row of filteredShifts) {
+      shiftCountByUser.set(row.user_id, (shiftCountByUser.get(row.user_id) || 0) + 1);
+      shiftHoursByUser.set(
+        row.user_id,
+        (shiftHoursByUser.get(row.user_id) || 0) + calculateShiftHours(row.start_time, row.end_time),
+      );
     }
 
-    return { count: result.length, data: result };
+    const penaltyByUser = new Map<string, { penalty_amount: number; edit_count: number }>();
+    for (const row of filteredPenalties) {
+      const previous = penaltyByUser.get(row.employee_id) || { penalty_amount: 0, edit_count: 0 };
+      penaltyByUser.set(row.employee_id, {
+        penalty_amount: previous.penalty_amount + Number(row.penalty_amount || 0),
+        edit_count: previous.edit_count + Number(row.edit_count || 0),
+      });
+    }
+
+    const lowScore = [...filteredEvaluations].sort((a: any, b: any) => Number(a.total_score || 0) - Number(b.total_score || 0))[0];
+    const topPenaltyEntry = [...penaltyByUser.entries()].sort((a, b) => b[1].penalty_amount - a[1].penalty_amount)[0];
+    const topShiftEntry = [...shiftCountByUser.entries()].sort((a, b) => b[1] - a[1])[0];
+    const topHoursEntry = [...shiftHoursByUser.entries()].sort((a, b) => b[1] - a[1])[0];
+    const lateRows = filteredAttendance.filter((row: any) => Number(row.late_minutes || 0) > 0);
+    const totalLateMinutes = lateRows.reduce((sum: number, row: any) => sum + Number(row.late_minutes || 0), 0);
+    const attentionRows = [
+      lowScore
+        ? {
+            type: "low_score",
+            label: "Điểm thấp nhất",
+            employee_name: profileMap[lowScore.employee_id]?.name || "Không rõ",
+            value: Number(lowScore.total_score || 0),
+          }
+        : null,
+      topPenaltyEntry
+        ? {
+            type: "penalty",
+            label: "Bị phạt nhiều nhất",
+            employee_name: profileMap[topPenaltyEntry[0]]?.name || "Không rõ",
+            value: topPenaltyEntry[1].penalty_amount,
+            edit_count: topPenaltyEntry[1].edit_count,
+          }
+        : null,
+    ].filter(Boolean);
+
+    return {
+      count: filteredShifts.length,
+      data: [
+        {
+          month_start: range.start,
+          month_end: range.end,
+          total_shifts: filteredShifts.length,
+          total_hours: Number(
+            [...shiftHoursByUser.values()].reduce((sum, value) => sum + value, 0).toFixed(2),
+          ),
+          total_employees: new Set(filteredShifts.map((row: any) => row.user_id)).size,
+          total_late_cases: lateRows.length,
+          total_late_minutes: totalLateMinutes,
+          lowest_score_employee: lowScore
+            ? {
+                name: profileMap[lowScore.employee_id]?.name || "Không rõ",
+                score: Number(lowScore.total_score || 0),
+              }
+            : null,
+          highest_penalty_employee: topPenaltyEntry
+            ? {
+                name: profileMap[topPenaltyEntry[0]]?.name || "Không rõ",
+                penalty_amount: topPenaltyEntry[1].penalty_amount,
+                edit_count: topPenaltyEntry[1].edit_count,
+              }
+            : null,
+          most_shifts_employee: topShiftEntry
+            ? {
+                name: profileMap[topShiftEntry[0]]?.name || "Không rõ",
+                shift_count: topShiftEntry[1],
+              }
+            : null,
+          most_hours_employee: topHoursEntry
+            ? {
+                name: profileMap[topHoursEntry[0]]?.name || "Không rõ",
+                total_hours: Number(topHoursEntry[1].toFixed(2)),
+              }
+            : null,
+          attention_items: attentionRows,
+        },
+      ],
+    };
   }
 
   return { error: "Loại truy vấn không hợp lệ." };
@@ -962,9 +1329,351 @@ async function executeMutation(
   return { error: "Hành động không hợp lệ." };
 }
 
+async function getAvailableEmployeesForEvaluation(
+  supabaseAdmin: ReturnType<typeof createClient>,
+  callerRole: string,
+  callerBranchId: string | null,
+  date: string,
+) {
+  const { data: shifts } = await supabaseAdmin
+    .from("shifts")
+    .select("user_id, actual_branch_id")
+    .eq("shift_date", date);
+
+  if (!shifts || shifts.length === 0) return [];
+
+  const userIds = [...new Set(shifts.map((item: any) => item.user_id))];
+  const { data: profiles } = await supabaseAdmin
+    .from("profiles")
+    .select("user_id, name, branch_id")
+    .in("user_id", userIds);
+
+  const profileMap = Object.fromEntries((profiles || []).map((item: any) => [item.user_id, item]));
+
+  return shifts
+    .map((shift: any) => {
+      const profile = profileMap[shift.user_id] || {};
+      const resolvedBranchId = shift.actual_branch_id || profile.branch_id || null;
+      return {
+        user_id: shift.user_id,
+        name: profile.name || "Không rõ",
+        branch_id: resolvedBranchId,
+      };
+    })
+    .filter((item: any) => !(callerRole === "HR" && callerBranchId && item.branch_id !== callerBranchId));
+}
+
+function buildEvaluationSelectionReply(date: string, employees: { name: string }[]) {
+  if (employees.length === 0) {
+    return `Hôm nay (${date}) không có nhân viên nào có ca để chấm điểm trong phạm vi bạn quản lý.`;
+  }
+
+  return [
+    `Hôm nay (${date}) có ${employees.length} nhân viên có ca để chấm điểm:`,
+    ...employees.map((employee, index) => `${index + 1}. ${employee.name}`),
+    "",
+    "Anh muốn chấm điểm cho ai?",
+  ].join("\n");
+}
+
+function buildEvaluationCriterionPrompt(employeeName: string, date: string, stepIndex: number) {
+  const criteria = getFlatEvaluationCriteria();
+  const criterion = criteria[stepIndex];
+  return `Đang chấm điểm cho **${employeeName}** ngày **${date}**.\nMục ${stepIndex + 1}/${criteria.length}: **${criterion.criterionLabel}** (${criterion.categoryLabel}, 0-${criterion.max}). Anh muốn cho mấy điểm?`;
+}
+
+async function createEvaluation(
+  supabaseAdmin: ReturnType<typeof createClient>,
+  payload: EvaluationPayload,
+  actor: { id: string; role: string; branchId: string | null },
+) {
+  const { data: existing } = await supabaseAdmin
+    .from("evaluations")
+    .select("id")
+    .eq("employee_id", payload.employee_id)
+    .eq("evaluation_date", payload.evaluation_date)
+    .maybeSingle();
+
+  if (actor.role === "HR" && actor.branchId && payload.branch_id !== actor.branchId) {
+    return { error: "Bạn chỉ được chấm điểm cho nhân viên thuộc chi nhánh mình quản lý." };
+  }
+
+  if (existing?.id) {
+    const { error, data } = await supabaseAdmin
+      .from("evaluations")
+      .update({
+        hr_id: actor.id,
+        total_score: payload.total_score,
+        categories_scores: payload.categories_scores,
+        feedback_events: payload.feedback_events,
+        bonus_score: payload.bonus_score,
+        manager_comment: payload.manager_comment,
+        branch_id: payload.branch_id,
+      })
+      .eq("id", existing.id)
+      .select()
+      .single();
+
+    if (error) return { error: error.message };
+    return { data, updated: true };
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from("evaluations")
+    .insert({
+      employee_id: payload.employee_id,
+      hr_id: actor.id,
+      evaluation_date: payload.evaluation_date,
+      total_score: payload.total_score,
+      categories_scores: payload.categories_scores,
+      feedback_events: payload.feedback_events,
+      bonus_score: payload.bonus_score,
+      manager_comment: payload.manager_comment,
+      branch_id: payload.branch_id,
+    })
+    .select()
+    .single();
+
+  if (error) return { error: error.message };
+  return { data, updated: false };
+}
+
+async function handleEvaluationConversation(
+  message: string,
+  messages: ChatMessage[],
+  supabaseAdmin: ReturnType<typeof createClient>,
+  actor: { id: string; role: string; branchId: string | null },
+  today: string,
+) {
+  const normalized = normalizeText(message);
+  const assistantHistory = messages.filter((item) => item.role === "assistant" && item.content).map((item) => item.content!.trim());
+  const lastAssistant = assistantHistory[assistantHistory.length - 1] || "";
+  const employeesToday = await getAvailableEmployeesForEvaluation(supabaseAdmin, actor.role, actor.branchId, today);
+
+  if (
+    normalized.includes("cham diem") ||
+    normalized.includes("chấm điểm") ||
+    normalized.includes("danh gia nhan vien") ||
+    normalized.includes("đánh giá nhân viên")
+  ) {
+    return { reply: buildEvaluationSelectionReply(today, employeesToday), mutations: false };
+  }
+
+  if (lastAssistant.includes("Anh muốn chấm điểm cho ai?")) {
+    const chosenName = inferEmployeeNameFromMessage(message) || inferEmployeeNameFromAssistantContext(messages);
+    const employee = employeesToday.find((item) => normalizeText(item.name).includes(normalizeText(chosenName || "")));
+    if (!employee) {
+      return { reply: "Tôi chưa xác định đúng nhân viên có ca hôm nay trong phạm vi bạn quản lý. Hãy nói lại đúng tên nhân viên.", mutations: false };
+    }
+    return { reply: buildEvaluationCriterionPrompt(employee.name, today, 0), mutations: false };
+  }
+
+  const criteria = getFlatEvaluationCriteria();
+  const criterionPromptMatch = lastAssistant.match(/Đang chấm điểm cho \*\*(.+?)\*\* ngày \*\*(\d{4}-\d{2}-\d{2})\*\*\.\nMục (\d+)\/(\d+):/);
+  if (criterionPromptMatch) {
+    const employeeName = criterionPromptMatch[1].trim();
+    const evaluationDate = criterionPromptMatch[2];
+    const score = extractNumericScore(message);
+    const currentStep = Number(criterionPromptMatch[3]) - 1;
+    const criterion = criteria[currentStep];
+
+    if (score === null || score < 0 || score > criterion.max) {
+      return { reply: `Điểm cho mục **${criterion.criterionLabel}** phải nằm trong khoảng 0-${criterion.max}. Anh nhập lại giúp tôi.`, mutations: false };
+    }
+
+    const scores = buildInitialEvaluationScores();
+    let lastEmployeeName = employeeName;
+    let scorePointer = 0;
+    for (let index = 0; index < messages.length; index += 1) {
+      const assistantMessage = messages[index];
+      if (assistantMessage.role !== "assistant" || !assistantMessage.content) continue;
+      const match = assistantMessage.content.match(/Đang chấm điểm cho \*\*(.+?)\*\* ngày \*\*(\d{4}-\d{2}-\d{2})\*\*\.\nMục (\d+)\/(\d+):/);
+      if (!match) continue;
+      lastEmployeeName = match[1].trim();
+      const promptStep = Number(match[3]) - 1;
+      const userAnswer = messages[index + 1];
+      if (!userAnswer || userAnswer.role !== "user" || !userAnswer.content) continue;
+      const parsedScore = extractNumericScore(userAnswer.content);
+      const config = criteria[promptStep];
+      if (parsedScore !== null && parsedScore >= 0 && parsedScore <= config.max) {
+        scores[config.categoryKey][config.criterionKey] = parsedScore;
+        scorePointer = Math.max(scorePointer, promptStep + 1);
+      }
+    }
+
+    scores[criterion.categoryKey][criterion.criterionKey] = score;
+    scorePointer = Math.max(scorePointer, currentStep + 1);
+
+    if (scorePointer < criteria.length) {
+      return {
+        reply: buildEvaluationCriterionPrompt(lastEmployeeName, evaluationDate, scorePointer),
+        mutations: false,
+      };
+    }
+
+    return {
+      reply: `Phần điểm cơ bản đã xong cho **${lastEmployeeName}**.\nAnh có muốn bật sự kiện phản hồi nào không? Chọn trong: **khách khen**, **nhắc nhở**, **phàn nàn trực tiếp**, **phàn nàn lên quản lý**. Nếu không có, trả lời **không**.`,
+      mutations: false,
+    };
+  }
+
+  const feedbackPromptActive = lastAssistant.includes("Phần điểm cơ bản đã xong cho");
+  if (feedbackPromptActive) {
+    const employeeMatch = lastAssistant.match(/cho \*\*(.+?)\*\*/);
+    const employeeName = employeeMatch?.[1]?.trim() || "";
+    const activeEvents = FEEDBACK_EVENTS.filter((event) => normalized.includes(normalizeText(event.label))).map((event) => event.key);
+    if (!isNoMessage(message) && activeEvents.length === 0) {
+      return { reply: "Tôi chưa hiểu sự kiện phản hồi. Anh hãy chọn: khách khen, nhắc nhở, phàn nàn trực tiếp, phàn nàn lên quản lý; hoặc trả lời `không`.", mutations: false };
+    }
+
+    return {
+      reply: `Đã ghi nhận phản hồi cho **${employeeName}**. Ca này có doanh thu trên 100 triệu không? Trả lời **có** hoặc **không**.`,
+      mutations: false,
+    };
+  }
+
+  const bonusPromptActive = lastAssistant.includes("Ca này có doanh thu trên 100 triệu không?");
+  if (bonusPromptActive) {
+    if (!isYesMessage(message) && !isNoMessage(message)) {
+      return { reply: "Anh hãy trả lời rõ **có** hoặc **không** để tôi chốt phần bonus.", mutations: false };
+    }
+    const employeeName = inferEmployeeNameFromAssistantContext(messages) || "nhân viên này";
+    return {
+      reply: `Hãy nhập nhận xét quản lý cho **${employeeName}** để tôi hoàn tất chấm điểm.`,
+      mutations: false,
+    };
+  }
+
+  const commentPromptActive = lastAssistant.includes("Hãy nhập nhận xét quản lý cho");
+  if (commentPromptActive) {
+    const employeeName = inferEmployeeNameFromAssistantContext(messages);
+    const employee = employeesToday.find((item) => normalizeText(item.name).includes(normalizeText(employeeName || "")));
+    if (!employee) {
+      return { reply: "Tôi không còn xác định chắc nhân viên đang được chấm điểm. Anh bắt đầu lại giúp tôi bằng câu `Tôi muốn chấm điểm cho nhân viên ca hôm nay`.", mutations: false };
+    }
+
+    const scores = buildInitialEvaluationScores();
+    for (let index = 0; index < messages.length; index += 1) {
+      const assistantMessage = messages[index];
+      if (assistantMessage.role !== "assistant" || !assistantMessage.content) continue;
+      const match = assistantMessage.content.match(/Đang chấm điểm cho \*\*(.+?)\*\* ngày \*\*(\d{4}-\d{2}-\d{2})\*\*\.\nMục (\d+)\/(\d+):/);
+      if (!match || normalizeText(match[1]) !== normalizeText(employee.name)) continue;
+      const promptStep = Number(match[3]) - 1;
+      const userAnswer = messages[index + 1];
+      if (!userAnswer || userAnswer.role !== "user" || !userAnswer.content) continue;
+      const parsedScore = extractNumericScore(userAnswer.content);
+      const config = criteria[promptStep];
+      if (parsedScore !== null && parsedScore >= 0 && parsedScore <= config.max) {
+        scores[config.categoryKey][config.criterionKey] = parsedScore;
+      }
+    }
+
+    let feedbackEvents: string[] = [];
+    let bonusScore = 0;
+    for (let index = 0; index < messages.length; index += 1) {
+      const assistantMessage = messages[index];
+      if (assistantMessage.role !== "assistant" || !assistantMessage.content) continue;
+      if (assistantMessage.content.includes("Phần điểm cơ bản đã xong cho")) {
+        const userAnswer = messages[index + 1];
+        if (userAnswer?.role === "user" && userAnswer.content && !isNoMessage(userAnswer.content)) {
+          feedbackEvents = FEEDBACK_EVENTS
+            .filter((event) => normalizeText(userAnswer.content || "").includes(normalizeText(event.label)))
+            .map((event) => event.key);
+        }
+      }
+      if (assistantMessage.content.includes("Ca này có doanh thu trên 100 triệu không?")) {
+        const userAnswer = messages[index + 1];
+        if (userAnswer?.role === "user" && userAnswer.content && isYesMessage(userAnswer.content)) {
+          bonusScore = 5;
+        }
+      }
+    }
+
+    const baseScore = Object.values(scores).reduce(
+      (sum, categoryScores) => sum + Object.values(categoryScores).reduce((inner, value) => inner + Number(value || 0), 0),
+      0,
+    );
+    const feedbackScore = FEEDBACK_EVENTS
+      .filter((event) => feedbackEvents.includes(event.key))
+      .reduce((sum, event) => sum + event.points, 0);
+    const totalScore = baseScore + feedbackScore + bonusScore;
+
+    const saveResult = await createEvaluation(
+      supabaseAdmin,
+      {
+        employee_name: employee.name,
+        employee_id: employee.user_id,
+        evaluation_date: today,
+        categories_scores: scores,
+        feedback_events: feedbackEvents,
+        bonus_score: bonusScore,
+        manager_comment: message.trim(),
+        total_score: totalScore,
+        branch_id: employee.branch_id,
+      },
+      actor,
+    );
+
+    if (saveResult.error) {
+      return { reply: `Tôi chưa thể lưu chấm điểm cho **${employee.name}**. Chi tiết: ${saveResult.error}`, mutations: false };
+    }
+
+    return {
+      reply: `${saveResult.updated ? "Đã cập nhật" : "Đã lưu"} chấm điểm cho **${employee.name}** ngày **${today}** với tổng điểm **${totalScore}/100**. Phần hiệu suất sẽ tự cập nhật realtime theo luồng hiện tại của hệ thống.`,
+      mutations: true,
+    };
+  }
+
+  return null;
+}
+
 function buildSummaryReplyFromQuery(message: string, result: QueryResult, today: string) {
   const normalized = normalizeText(message);
   const rows = result.data || [];
+
+  if (
+    normalized.includes("thang nay") ||
+    normalized.includes("tháng này") ||
+    normalized.includes("tong so ca") ||
+    normalized.includes("tổng số ca") ||
+    normalized.includes("tong gio lam") ||
+    normalized.includes("tổng giờ làm") ||
+    normalized.includes("diem thap nhat") ||
+    normalized.includes("điểm thấp nhất") ||
+    normalized.includes("bi phat nhieu nhat") ||
+    normalized.includes("bị phạt nhiều nhất")
+  ) {
+    const summary = rows[0] || {};
+    if (!summary || Object.keys(summary).length === 0) {
+      return "Tháng này chưa có đủ dữ liệu để tổng hợp.";
+    }
+
+    const lines = [
+      `Tổng hợp tháng này (${summary.month_start} đến ${summary.month_end}):`,
+      `- Tổng số ca: **${summary.total_shifts || 0}**`,
+      `- Tổng giờ làm: **${summary.total_hours || 0}** giờ`,
+      `- Số nhân viên có ca: **${summary.total_employees || 0}**`,
+      `- Lượt đi muộn: **${summary.total_late_cases || 0}** (${summary.total_late_minutes || 0} phút)`,
+    ];
+
+    if (summary.lowest_score_employee) {
+      lines.push(`- Nhân viên điểm thấp nhất: **${summary.lowest_score_employee.name}** (${summary.lowest_score_employee.score} điểm)`);
+    }
+
+    if (summary.highest_penalty_employee) {
+      lines.push(`- Nhân viên bị phạt nhiều nhất: **${summary.highest_penalty_employee.name}** (${summary.highest_penalty_employee.penalty_amount} - ${summary.highest_penalty_employee.edit_count} lần chỉnh ca)`);
+    }
+
+    if (summary.most_shifts_employee) {
+      lines.push(`- Nhân viên có nhiều ca nhất: **${summary.most_shifts_employee.name}** (${summary.most_shifts_employee.shift_count} ca)`);
+    }
+
+    if (summary.most_hours_employee) {
+      lines.push(`- Nhân viên có nhiều giờ làm nhất: **${summary.most_hours_employee.name}** (${summary.most_hours_employee.total_hours} giờ)`);
+    }
+
+    return lines.join("\n");
+  }
 
   if (normalized.includes("bao nhieu") && (normalized.includes("nguoi lam") || normalized.includes("người làm"))) {
     return `Hôm nay (${today}) có **${result.count || 0}** người có ca làm.`;
@@ -1028,6 +1737,7 @@ function inferFallbackIntent(message: string, role: string, today: string): { qu
     normalized.includes("cho nghi") ||
     normalized.includes("them ca") ||
     normalized.includes("xoa ca") ||
+    normalized.includes("huy ca") ||
     normalized.includes("sua ca")
   )) {
     return { reply: "Bạn không có quyền thực hiện thay đổi dữ liệu." };
@@ -1035,6 +1745,23 @@ function inferFallbackIntent(message: string, role: string, today: string): { qu
 
   if (normalized.includes("bao nhieu") && (normalized.includes("nguoi lam") || normalized.includes("người làm"))) {
     return { queryArgs: { query_type: "shifts", date: today } };
+  }
+
+  if (
+    normalized.includes("thang nay") ||
+    normalized.includes("tháng này") ||
+    normalized.includes("tong so ca") ||
+    normalized.includes("tổng số ca") ||
+    normalized.includes("tong gio lam") ||
+    normalized.includes("tổng giờ làm") ||
+    normalized.includes("diem thap nhat") ||
+    normalized.includes("điểm thấp nhất") ||
+    normalized.includes("bi phat nhieu nhat") ||
+    normalized.includes("bị phạt nhiều nhất") ||
+    normalized.includes("van de gi") ||
+    normalized.includes("vấn đề gì")
+  ) {
+    return { queryArgs: { query_type: "monthly_summary", date: today } };
   }
 
   if (normalized.includes("ca toi")) {
@@ -1102,7 +1829,13 @@ function extractMutationFromMessage(message: string, today: string): MutationPay
   const inferredTimes = inferShiftTimesFromMessage(message);
   const inferredStart = inferSingleTimeFromMessage(message);
 
-  if (normalized.includes("cho") && normalized.includes("nghi")) {
+  if (
+    (normalized.includes("cho") && normalized.includes("nghi")) ||
+    normalized.includes("xoa ca") ||
+    normalized.includes("xóa ca") ||
+    normalized.includes("huy ca") ||
+    normalized.includes("hủy ca")
+  ) {
     return {
       action: "delete_shifts",
       date: inferDateFromMessage(message, today),
@@ -1248,8 +1981,18 @@ async function handleFallback(
   supabaseAdmin: ReturnType<typeof createClient>,
   callerBranchId: string | null,
   actorName: string | null,
+  actorUserId: string,
   today: string,
 ) {
+  const evaluationFlow = await handleEvaluationConversation(
+    message,
+    messages.slice(0, -1),
+    supabaseAdmin,
+    { id: actorUserId, role, branchId: callerBranchId },
+    today,
+  );
+  if (evaluationFlow) return evaluationFlow;
+
   const pendingConfirmation = hasPendingConfirmation(messages.slice(0, -1));
   const latestMutationPayload = findLatestMutationPayload(messages.slice(0, -1), today);
 
@@ -1375,7 +2118,7 @@ serve(async (req) => {
     // if there is a pending mutation summary and user presses confirm/cancel,
     // execute the fallback confirmation flow immediately instead of asking the model again.
     if (hasPendingConfirmation(safeMessages.slice(0, -1)) && (includesAny(currentMessage, CONFIRM_PHRASES) || includesAny(currentMessage, CANCEL_PHRASES))) {
-      const confirmed = await handleFallback(currentMessage, safeMessages, userRole, supabaseAdmin, callerBranchId, actorName, today);
+      const confirmed = await handleFallback(currentMessage, safeMessages, userRole, supabaseAdmin, callerBranchId, actorName, user.id, today);
       return buildLoggedResponse({ ...confirmed, role: userRole, mode: "confirmation" }, 200, auditBase, supabaseAdmin);
     }
 
@@ -1386,9 +2129,14 @@ serve(async (req) => {
       }, 429, auditBase, supabaseAdmin);
     }
 
+    if (shouldUseDeterministicFallback(currentMessage, safeMessages.slice(0, -1))) {
+      const deterministic = await handleFallback(currentMessage, safeMessages, userRole, supabaseAdmin, callerBranchId, actorName, user.id, today);
+      return buildLoggedResponse({ ...deterministic, role: userRole, mode: "deterministic" }, 200, auditBase, supabaseAdmin);
+    }
+
     const openAiApiKey = Deno.env.get("OPENAI_API_KEY");
     if (!openAiApiKey) {
-      const fallback = await handleFallback(currentMessage, safeMessages, userRole, supabaseAdmin, callerBranchId, actorName, today);
+      const fallback = await handleFallback(currentMessage, safeMessages, userRole, supabaseAdmin, callerBranchId, actorName, user.id, today);
       return buildLoggedResponse({ ...fallback, role: userRole, mode: "fallback" }, 200, auditBase, supabaseAdmin);
     }
 
@@ -1452,7 +2200,7 @@ serve(async (req) => {
       }, 200, auditBase, supabaseAdmin);
     } catch (error) {
       console.error("OpenAI flow failed, switching to fallback:", error);
-      const fallback = await handleFallback(currentMessage, safeMessages, userRole, supabaseAdmin, callerBranchId, actorName, today);
+      const fallback = await handleFallback(currentMessage, safeMessages, userRole, supabaseAdmin, callerBranchId, actorName, user.id, today);
       return buildLoggedResponse({
         ...fallback,
         role: userRole,

@@ -10,6 +10,8 @@ import { useAuth } from '@/contexts/AuthContext';
 import { supabase } from '@/integrations/supabase/client';
 import { calculateDistance } from '@/lib/geo-utils';
 
+type PermissionStateLike = 'granted' | 'denied' | 'prompt' | 'unsupported';
+
 type GeoState =
   | { status: 'loading' }
   | { status: 'no_branch' }
@@ -18,6 +20,43 @@ type GeoState =
   | { status: 'error'; message: string }
   | { status: 'out_of_range'; distance: number; branchName: string; allowedRadius: number }
   | { status: 'in_range'; distance: number };
+
+function getCurrentPositionWithOptions(options: PositionOptions) {
+  return new Promise<GeolocationPosition>((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition(resolve, reject, options);
+  });
+}
+
+async function getLocationPermissionState(): Promise<PermissionStateLike> {
+  if (!('permissions' in navigator) || !navigator.permissions?.query) return 'unsupported';
+
+  try {
+    const result = await navigator.permissions.query({ name: 'geolocation' as PermissionName });
+    return result.state;
+  } catch {
+    return 'unsupported';
+  }
+}
+
+async function resolveDevicePosition() {
+  const attempts: PositionOptions[] = [
+    { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 },
+    { enableHighAccuracy: false, timeout: 10000, maximumAge: 60000 },
+    { enableHighAccuracy: false, timeout: 20000, maximumAge: 300000 },
+  ];
+
+  let lastError: GeolocationPositionError | null = null;
+  for (const options of attempts) {
+    try {
+      return await getCurrentPositionWithOptions(options);
+    } catch (error) {
+      lastError = error as GeolocationPositionError;
+      if (lastError.code === lastError.PERMISSION_DENIED) throw lastError;
+    }
+  }
+
+  throw lastError || new Error('Unable to resolve position');
+}
 
 export default function CheckInPage() {
   const { user } = useAuth();
@@ -33,7 +72,6 @@ export default function CheckInPage() {
       return;
     }
 
-    // Fetch branch GPS config
     const { data: branch } = await supabase
       .from('branches')
       .select('branch_name, latitude, longitude, allowed_radius_meters')
@@ -41,7 +79,6 @@ export default function CheckInPage() {
       .single();
 
     if (!branch || branch.latitude == null || branch.longitude == null) {
-      // Branch has no GPS configured — allow check-in freely
       setGeo({ status: 'no_gps_config' });
       return;
     }
@@ -52,34 +89,53 @@ export default function CheckInPage() {
     const branchName = branch.branch_name;
 
     if (!navigator.geolocation) {
-      setGeo({ status: 'error', message: 'Trình duyệt không hỗ trợ định vị GPS.' });
+      setGeo({ status: 'error', message: 'Trình duyệt này không hỗ trợ định vị GPS.' });
       return;
     }
 
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        const dist = calculateDistance(pos.coords.latitude, pos.coords.longitude, branchLat, branchLng);
-        const rounded = Math.round(dist);
-        if (rounded <= allowedRadius) {
-          setGeo({ status: 'in_range', distance: rounded });
-        } else {
-          setGeo({ status: 'out_of_range', distance: rounded, branchName, allowedRadius });
-        }
-      },
-      (err) => {
-        if (err.code === err.PERMISSION_DENIED) {
-          setGeo({ status: 'denied' });
-        } else {
-          setGeo({ status: 'error', message: 'Không thể xác định vị trí. Tín hiệu GPS yếu.' });
-        }
-      },
-      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
-    );
+    const permissionState = await getLocationPermissionState();
+    if (permissionState === 'denied') {
+      setGeo({ status: 'denied' });
+      return;
+    }
+
+    try {
+      const pos = await resolveDevicePosition();
+      const dist = calculateDistance(pos.coords.latitude, pos.coords.longitude, branchLat, branchLng);
+      const rounded = Math.round(dist);
+
+      if (rounded <= allowedRadius) {
+        setGeo({ status: 'in_range', distance: rounded });
+      } else {
+        setGeo({ status: 'out_of_range', distance: rounded, branchName, allowedRadius });
+      }
+    } catch (error) {
+      const err = error as GeolocationPositionError;
+
+      if (err?.code === err.PERMISSION_DENIED) {
+        setGeo({ status: 'denied' });
+        return;
+      }
+
+      if (err?.code === err.POSITION_UNAVAILABLE) {
+        setGeo({
+          status: 'error',
+          message: 'Điện thoại chưa lấy được GPS. Hãy bật Vị trí chính xác hoặc di chuyển ra nơi tín hiệu tốt hơn rồi thử lại.',
+        });
+        return;
+      }
+
+      setGeo({
+        status: 'error',
+        message: 'Lấy vị trí bị quá thời gian hoặc GPS không ổn định. Hãy bật Vị trí chính xác rồi thử lại.',
+      });
+    }
   }, [user]);
 
-  useEffect(() => { checkLocation(); }, [checkLocation]);
+  useEffect(() => {
+    checkLocation();
+  }, [checkLocation]);
 
-  // Loading state
   if (geo.status === 'loading') {
     return (
       <div className="mx-auto max-w-lg space-y-5">
@@ -99,7 +155,6 @@ export default function CheckInPage() {
     );
   }
 
-  // Permission denied
   if (geo.status === 'denied') {
     return (
       <div className="mx-auto max-w-lg space-y-5">
@@ -109,9 +164,9 @@ export default function CheckInPage() {
               <AlertTriangle className="h-8 w-8 text-yellow-600" />
             </div>
             <div className="space-y-1">
-              <p className="font-semibold text-foreground">⚠️ Vui lòng cấp quyền Vị trí cho trình duyệt để chấm công.</p>
+              <p className="font-semibold text-foreground">Vui lòng cấp quyền vị trí cho trình duyệt để chấm công.</p>
               <p className="text-sm text-muted-foreground">
-                Mở cài đặt trình duyệt → cho phép vị trí cho trang này, sau đó thử lại.
+                Mở cài đặt trình duyệt rồi cho phép vị trí cho trang này, sau đó thử lại.
               </p>
             </div>
             <Button variant="outline" onClick={checkLocation} className="gap-2">
@@ -123,7 +178,6 @@ export default function CheckInPage() {
     );
   }
 
-  // GPS error
   if (geo.status === 'error') {
     return (
       <div className="mx-auto max-w-lg space-y-5">
@@ -142,7 +196,6 @@ export default function CheckInPage() {
     );
   }
 
-  // Out of range
   if (geo.status === 'out_of_range') {
     return (
       <div className="mx-auto max-w-lg space-y-5">
@@ -152,9 +205,7 @@ export default function CheckInPage() {
               <MapPinOff className="h-8 w-8 text-destructive" />
             </div>
             <div className="space-y-1">
-              <p className="font-semibold text-foreground">
-                ❌ Bạn đang ở ngoài phạm vi chấm công.
-              </p>
+              <p className="font-semibold text-foreground">Bạn đang ở ngoài phạm vi chấm công.</p>
               <p className="text-sm text-foreground">
                 Vui lòng di chuyển đến <span className="font-semibold">{geo.branchName}</span>.
               </p>
@@ -173,7 +224,6 @@ export default function CheckInPage() {
     );
   }
 
-  // No branch assigned or no GPS config — allow check-in freely
   const showLocationBadge = geo.status === 'in_range';
 
   return (
@@ -197,7 +247,10 @@ export default function CheckInPage() {
         </div>
       )}
 
-      <CameraCheckIn geoAllowed={geo.status === 'in_range' || geo.status === 'no_gps_config'} onRefreshLocation={checkLocation} />
+      <CameraCheckIn
+        geoAllowed={geo.status === 'in_range' || geo.status === 'no_gps_config'}
+        onRefreshLocation={checkLocation}
+      />
       <Separator />
       <div>
         <h3 className="text-sm font-semibold text-foreground mb-4">Tuần này</h3>
