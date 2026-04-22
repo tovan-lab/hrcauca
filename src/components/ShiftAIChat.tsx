@@ -9,6 +9,7 @@ import { Send, X, Loader2, Trash2, Sparkles } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast } from 'sonner';
 import ReactMarkdown from 'react-markdown';
+import { supabase } from '@/integrations/supabase/client';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -21,12 +22,16 @@ interface ShiftAIChatProps {
 }
 
 const CHAT_REQUEST_TIMEOUT_MS = 30000;
+const INTERNAL_CONFIRM_MESSAGE = 'confirm';
+const INTERNAL_CANCEL_MESSAGE = 'cancel';
 
 const QUICK_ACTIONS_HR = [
   'Hôm nay có bao nhiêu người làm?',
   'Ai làm ca tối nay?',
+  'Hôm nay có ai được chấm điểm không?',
   'Thống kê chấm công tuần này',
   'Danh sách nhân viên đi muộn',
+  'Danh sách chi nhánh hiện có',
 ];
 
 const QUICK_ACTIONS_ADMIN = [
@@ -34,18 +39,6 @@ const QUICK_ACTIONS_ADMIN = [
   'Cho nhân viên A nghỉ hôm nay',
   'Thêm ca cho nhân viên B',
 ];
-
-async function parseChatResponse(resp: Response): Promise<Record<string, unknown>> {
-  const raw = await resp.text();
-
-  if (!raw) return {};
-
-  try {
-    return JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    return { error: raw };
-  }
-}
 
 function appendAssistantMessage(
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>,
@@ -61,11 +54,13 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [conversationId, setConversationId] = useState(() => crypto.randomUUID());
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const isAdmin = user?.role === 'ADMIN';
   const isEmployee = !user || user.role === 'EMPLOYEE';
+  const canManageShifts = !!user && user.role !== 'EMPLOYEE';
   const quickActions = isAdmin ? QUICK_ACTIONS_ADMIN : QUICK_ACTIONS_HR;
 
   const scrollToBottom = useCallback(() => {
@@ -91,62 +86,76 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
     const msgText = (text || input).trim();
     if (!msgText || loading) return;
 
+    const isInternalAction = msgText === INTERNAL_CONFIRM_MESSAGE || msgText === INTERNAL_CANCEL_MESSAGE;
     const userMsg: Message = { role: 'user', content: msgText };
-    const newMessages = [...messages, userMsg];
+    const newMessages = isInternalAction ? [...messages] : [...messages, userMsg];
     const controller = new AbortController();
     const timeoutId = window.setTimeout(() => controller.abort(), CHAT_REQUEST_TIMEOUT_MS);
 
-    setMessages(newMessages);
-    setInput('');
+    if (!isInternalAction) {
+      setMessages(newMessages);
+      setInput('');
+    }
     setLoading(true);
 
     try {
-      const chatUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/ai-shift-assistant`;
-      const resp = await fetch(chatUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.access_token}`,
-          apikey: import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
-        },
-        body: JSON.stringify({ messages: newMessages.map(m => ({ role: m.role, content: m.content })) }),
-        signal: controller.signal,
-      });
+      const { data: { session: activeSession } } = await supabase.auth.getSession();
+      const accessToken = activeSession?.access_token || session?.access_token;
 
-      if (resp.status === 401) {
+      if (!accessToken) {
         appendAssistantMessage(setMessages, 'Phiên đăng nhập đã hết hạn hoặc token không hợp lệ. Hãy đăng xuất rồi đăng nhập lại.');
         toast.error('Phiên đăng nhập không hợp lệ.');
         return;
       }
-      if (resp.status === 403) {
+
+      const invokePromise = supabase.functions.invoke('ai-shift-assistant', {
+        body: {
+          conversation_id: conversationId,
+          messages: [...newMessages, userMsg].map(m => ({ role: m.role, content: m.content })),
+        },
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      });
+
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        controller.signal.addEventListener('abort', () => {
+          reject(new DOMException('Request timed out', 'AbortError'));
+        }, { once: true });
+      });
+
+      const { data, error } = await Promise.race([invokePromise, timeoutPromise]);
+
+      const status = (error as { context?: { status?: number } } | null)?.context?.status;
+      const errorMessage = typeof error?.message === 'string' ? error.message : '';
+
+      if (status === 401) {
+        appendAssistantMessage(setMessages, 'Phiên đăng nhập đã hết hạn hoặc token không hợp lệ. Hãy đăng xuất rồi đăng nhập lại.');
+        toast.error('Phiên đăng nhập không hợp lệ.');
+        return;
+      }
+      if (status === 403) {
         appendAssistantMessage(setMessages, 'Bạn không có quyền sử dụng Trợ lý AI.');
         toast.error('Bạn không có quyền sử dụng Trợ lý AI.');
         return;
       }
-      if (resp.status === 429) {
+      if (status === 429) {
         appendAssistantMessage(setMessages, 'Hệ thống AI đang bận. Vui lòng thử lại sau ít phút.');
         toast.error('Hệ thống đang bận, vui lòng thử lại sau.');
         return;
       }
-      if (resp.status === 402) {
+      if (status === 402) {
         appendAssistantMessage(setMessages, 'Dịch vụ AI hiện không khả dụng do hết hạn mức cấu hình ở backend.');
         toast.error('Hết hạn mức AI.');
         return;
       }
 
-      const data = await parseChatResponse(resp);
-      const errorMessage = typeof data.error === 'string' ? data.error : '';
-
-      if (!resp.ok) {
-        throw new Error(errorMessage || `Chatbot request failed (${resp.status})`);
-      }
-
-      if (errorMessage) {
+      if (error) {
         throw new Error(errorMessage);
       }
 
-      const reply = typeof data.reply === 'string' ? data.reply : '';
-      const needsConfirm = isAdmin && reply.toLowerCase().includes('xác nhận');
+      const reply = typeof data?.reply === 'string' ? data.reply : '';
+      const needsConfirm = canManageShifts && reply.toLowerCase().includes('xác nhận');
 
       setMessages(prev => [
         ...prev,
@@ -157,12 +166,12 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
         },
       ]);
 
-      if (data.mutations && onDataChanged) onDataChanged();
+      if (data?.mutations && onDataChanged) onDataChanged();
     } catch (err) {
       console.error('AI Chat error:', err);
       const message = err instanceof Error
         ? err.name === 'AbortError'
-          ? 'Chatbot quá thời gian chờ phản hồi. Hãy kiểm tra Edge Function và API Gemini.'
+          ? 'Chatbot quá thời gian chờ phản hồi. Hãy kiểm tra Edge Function và API OpenAI.'
           : err.message
         : 'Lỗi kết nối với Trợ lý AI';
 
@@ -182,17 +191,18 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
 
   const handleConfirm = () => {
     setMessages(prev => prev.map(m => ({ ...m, pending_confirmation: false })));
-    sendMessage('Xác nhận thay đổi');
+    sendMessage(INTERNAL_CONFIRM_MESSAGE);
   };
 
   const handleCancel = () => {
-    setMessages(prev => [
-      ...prev.map(m => ({ ...m, pending_confirmation: false })),
-      { role: 'assistant' as const, content: 'Đã hủy thay đổi.' },
-    ]);
+    setMessages(prev => prev.map(m => ({ ...m, pending_confirmation: false })));
+    sendMessage(INTERNAL_CANCEL_MESSAGE);
   };
 
-  const clearChat = () => setMessages([]);
+  const clearChat = () => {
+    setMessages([]);
+    setConversationId(crypto.randomUUID());
+  };
 
   const hasPendingConfirmation = messages.some(m => m.pending_confirmation);
 
@@ -206,7 +216,7 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
           <div>
             <h3 className="text-sm font-semibold text-foreground">Trợ lý AI HR</h3>
             <span className="text-[10px] text-muted-foreground">
-              {isAdmin ? 'Admin · Toàn quyền' : 'HR · Chỉ xem'}
+              {isAdmin ? 'HR · Toàn hệ thống' : 'Quản lý · Theo chi nhánh'}
             </span>
           </div>
         </div>
@@ -233,7 +243,7 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
               <p className="text-xs">
                 Tôi là Trợ lý AI của HR Cậu Cả.
                 <br />
-                Hỏi tôi về ca làm, chấm công, đánh giá.
+                Hỏi tôi về ca làm, chấm công, đánh giá, nhân sự, chi nhánh.
               </p>
               <div className="pt-2">
                 <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">Gợi ý nhanh</p>
@@ -271,7 +281,7 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
                 </div>
               </div>
 
-              {m.pending_confirmation && isAdmin && (
+              {m.pending_confirmation && canManageShifts && (
                 <div className="flex gap-2 mt-2 ml-1">
                   <Button size="sm" onClick={handleConfirm} className="text-xs gap-1 h-8 bg-primary hover:bg-primary/90">
                     Xác nhận thay đổi

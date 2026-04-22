@@ -7,7 +7,7 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
-const GEMINI_MODEL = "gemini-2.5-flash";
+const OPENAI_MODEL = "gpt-4.1-mini";
 const AI_CHAT_WINDOW_SECONDS = 60;
 const AI_CHAT_MAX_REQUESTS_PER_WINDOW = 12;
 const CONFIRM_PHRASES = ["xác nhận", "dong y", "đồng ý", "ok", "oke", "confirm", "thực hiện"];
@@ -25,6 +25,12 @@ type QueryResult = {
   error?: string;
 };
 
+type ActorContext = {
+  callerRole: string;
+  callerBranchId: string | null;
+  actorName?: string | null;
+};
+
 type MutationPayload = {
   action: "delete_shifts" | "add_shifts" | "update_shifts";
   date: string;
@@ -36,15 +42,134 @@ type MutationPayload = {
   };
 };
 
-type GeminiFunctionCall = {
-  name: string;
-  args?: Record<string, unknown>;
+type ChatAuditPayload = {
+  conversationId: string;
+  userId: string;
+  userRole: string;
+  branchId: string | null;
+  actorName: string | null;
+  userMessage: string;
+  assistantReply: string;
+  mutationsApplied: boolean;
+  metadata?: Record<string, unknown>;
+};
+
+type OpenAIFunctionCall = {
+  id?: string;
+  function?: {
+    name?: string;
+    arguments?: string;
+  };
 };
 
 function jsonResponse(body: Record<string, unknown>, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
     headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+function actorLabel(actor: ActorContext) {
+  if (actor.actorName) return actor.actorName;
+  return actor.callerRole === "HR" ? "Quản lý" : "HR";
+}
+
+function formatDisplayDate(date: string) {
+  const [year, month, day] = date.split("-");
+  return day && month && year ? `${day}/${month}/${year}` : date;
+}
+
+async function enqueueTransactionalEmail(
+  supabaseAdmin: ReturnType<typeof createClient>,
+  payload: Record<string, unknown>,
+) {
+  try {
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+    if (!supabaseUrl || !serviceRoleKey) {
+      console.warn("send-transactional-email skipped: missing Supabase env");
+      return;
+    }
+
+    const response = await fetch(`${supabaseUrl}/functions/v1/send-transactional-email`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${serviceRoleKey}`,
+        apikey: serviceRoleKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.warn("send-transactional-email failed:", response.status, errorText);
+    }
+  } catch (error) {
+    console.warn("send-transactional-email exception:", error);
+  }
+}
+
+async function sendShiftAssignedEmail(
+  supabaseAdmin: ReturnType<typeof createClient>,
+  employee: { user_id: string; name: string },
+  date: string,
+  startTime: string,
+  endTime: string,
+  actor: ActorContext,
+) {
+  const { data: profile } = await supabaseAdmin
+    .from("profiles")
+    .select("email, name")
+    .eq("user_id", employee.user_id)
+    .maybeSingle();
+
+  if (!profile?.email) return;
+
+  await enqueueTransactionalEmail(supabaseAdmin, {
+    templateName: "shift-assigned",
+    recipientEmail: profile.email,
+    idempotencyKey: `ai-shift-assigned-${employee.user_id}-${date}-${startTime}-${endTime}`,
+    templateData: {
+      name: profile.name || employee.name,
+      shiftDate: formatDisplayDate(date),
+      startTime: startTime.slice(0, 5),
+      endTime: endTime.slice(0, 5),
+      assignedBy: actorLabel(actor),
+    },
+  });
+}
+
+async function sendShiftCancelledEmail(
+  supabaseAdmin: ReturnType<typeof createClient>,
+  employee: { user_id: string; name: string },
+  date: string,
+  startTime: string,
+  endTime: string,
+  actor: ActorContext,
+  reason?: string,
+) {
+  const { data: profile } = await supabaseAdmin
+    .from("profiles")
+    .select("email, name")
+    .eq("user_id", employee.user_id)
+    .maybeSingle();
+
+  if (!profile?.email) return;
+
+  await enqueueTransactionalEmail(supabaseAdmin, {
+    templateName: "shift-cancelled",
+    recipientEmail: profile.email,
+    idempotencyKey: `ai-shift-cancelled-${employee.user_id}-${date}-${startTime}-${endTime}`,
+    templateData: {
+      name: profile.name || employee.name,
+      shiftDate: formatDisplayDate(date),
+      startTime: startTime.slice(0, 5),
+      endTime: endTime.slice(0, 5),
+      cancelledBy: actorLabel(actor),
+      reason,
+    },
   });
 }
 
@@ -83,6 +208,59 @@ async function enforceAiChatRateLimit(
   return { allowed: true };
 }
 
+async function logAiChatTurn(
+  supabaseAdmin: ReturnType<typeof createClient>,
+  payload: ChatAuditPayload,
+) {
+  try {
+    const { error } = await supabaseAdmin.from("ai_chat_audit_logs").insert({
+      conversation_id: payload.conversationId,
+      user_id: payload.userId,
+      user_role: payload.userRole,
+      branch_id: payload.branchId,
+      actor_name: payload.actorName,
+      user_message: payload.userMessage,
+      assistant_reply: payload.assistantReply,
+      mutations_applied: payload.mutationsApplied,
+      metadata: payload.metadata || {},
+    });
+
+    if (error) {
+      console.error("Failed to log ai chat audit:", error);
+    }
+  } catch (error) {
+    console.error("ai chat audit exception:", error);
+  }
+}
+
+function buildLoggedResponse(
+  body: Record<string, unknown>,
+  status: number,
+  audit: ChatAuditPayload | null,
+  supabaseAdmin: ReturnType<typeof createClient> | null,
+) {
+  if (audit && supabaseAdmin) {
+    const assistantReply = typeof body.reply === "string"
+      ? body.reply
+      : typeof body.error === "string"
+      ? body.error
+      : "";
+    void logAiChatTurn(supabaseAdmin, {
+      ...audit,
+      assistantReply,
+      mutationsApplied: Boolean(body.mutations),
+      metadata: {
+        ...(audit.metadata || {}),
+        status,
+        mode: body.mode,
+        warning: body.warning,
+      },
+    });
+  }
+
+  return jsonResponse(body, status);
+}
+
 function normalizeText(text: string) {
   return text
     .normalize("NFD")
@@ -117,6 +295,10 @@ function hasPendingConfirmation(messages: ChatMessage[]) {
   return normalizeText(lastAssistant).includes("ban co muon xac nhan thay doi nay khong");
 }
 
+function canMutate(role: string) {
+  return role === "ADMIN" || role === "HR";
+}
+
 function getSystemPrompt(role: string, today: string) {
   const base = `Bạn là Trợ lý AI HR của hệ thống "HR Cậu Cả".
 
@@ -129,16 +311,19 @@ Quy tắc chung:
   if (role === "HR") {
     return `${base}
 
-Vai trò của bạn: HR chỉ được phép đọc dữ liệu.
-- Chỉ truy vấn thông tin ca làm, chấm công, đánh giá, nhân sự.
-- Nếu người dùng yêu cầu thay đổi dữ liệu, từ chối rõ ràng và hướng dẫn liên hệ Admin.
-- Tuyệt đối không thực hiện mutation.`;
+Vai trò của bạn: QUẢN LÝ CHI NHÁNH.
+- Có thể truy vấn thông tin trong hệ thống liên quan đến ca làm, chấm công, đánh giá, nhân sự và chi nhánh của mình.
+- Có thể xếp ca, thêm ca, hủy ca cho nhân viên thuộc chi nhánh mình quản lý.
+- Với mọi yêu cầu thay đổi ca làm, phải tóm tắt hành động trước và kết thúc bằng đúng câu:
+"Bạn có muốn xác nhận thay đổi này không?"
+- Chỉ thực hiện mutation sau khi người dùng xác nhận.
+- Không được thay đổi dữ liệu ngoài phạm vi chi nhánh của mình.`;
   }
 
   return `${base}
 
-Vai trò của bạn: ADMIN.
-- Có thể truy vấn và thay đổi dữ liệu.
+Vai trò của bạn: HR TOÀN HỆ THỐNG.
+- Có thể truy vấn và thay đổi dữ liệu toàn hệ thống.
 - Với mọi yêu cầu thay đổi ca làm, phải tóm tắt hành động trước và kết thúc bằng đúng câu:
 "Bạn có muốn xác nhận thay đổi này không?"
 - Chỉ thực hiện mutation sau khi người dùng xác nhận.`;
@@ -154,7 +339,7 @@ const queryTool = {
       properties: {
         query_type: {
           type: "string",
-          enum: ["shifts", "attendance", "evaluations", "employees"],
+          enum: ["shifts", "attendance", "evaluations", "employees", "branches"],
         },
         date: { type: "string" },
         date_from: { type: "string" },
@@ -198,37 +383,26 @@ const mutationTool = {
   },
 };
 
-function toGeminiRole(role: string): "user" | "model" {
-  return role === "assistant" ? "model" : "user";
-}
-
-function buildGeminiContents(messages: ChatMessage[]) {
-  return messages
+function buildOpenAIMessages(messages: ChatMessage[], systemPrompt: string) {
+  const chatMessages = messages
     .filter((message) => typeof message?.content === "string" && message.content.trim().length > 0)
     .map((message) => ({
-      role: toGeminiRole(message.role),
-      parts: [{ text: message.content!.trim() }],
+      role: message.role === "assistant" ? "assistant" : "user",
+      content: message.content!.trim(),
     }));
+
+  return [{ role: "system", content: systemPrompt }, ...chatMessages];
 }
 
-function buildGeminiTools(role: string) {
-  const tools = role === "ADMIN" ? [queryTool, mutationTool] : [queryTool];
-  return [
-    {
-      functionDeclarations: tools.map((tool) => ({
-        name: tool.function.name,
-        description: tool.function.description,
-        parameters: tool.function.parameters,
-      })),
-    },
-  ];
+function buildOpenAITools(role: string) {
+  return canMutate(role) ? [queryTool, mutationTool] : [queryTool];
 }
 
-async function callGemini(payload: Record<string, unknown>, apiKey: string) {
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
+async function callOpenAI(payload: Record<string, unknown>, apiKey: string) {
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      "x-goog-api-key": apiKey,
+      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
@@ -236,32 +410,249 @@ async function callGemini(payload: Record<string, unknown>, apiKey: string) {
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`Gemini API error ${response.status}: ${body}`);
+    throw new Error(`OpenAI API error ${response.status}: ${body}`);
   }
 
   return response.json();
 }
 
-function extractTextFromGemini(data: any): string {
-  const parts = data?.candidates?.[0]?.content?.parts || [];
-  return parts
-    .map((part: any) => part?.text)
-    .filter((text: unknown): text is string => typeof text === "string" && text.length > 0)
-    .join("\n")
-    .trim();
+function extractTextFromOpenAI(data: any): string {
+  return data?.choices?.[0]?.message?.content?.trim() || "";
 }
 
-function extractFunctionCallsFromGemini(data: any): GeminiFunctionCall[] {
-  const parts = data?.candidates?.[0]?.content?.parts || [];
-  return parts
-    .map((part: any) => part?.functionCall)
-    .filter((call: unknown): call is GeminiFunctionCall => Boolean(call?.name));
+function extractFunctionCallsFromOpenAI(data: any): OpenAIFunctionCall[] {
+  return data?.choices?.[0]?.message?.tool_calls || [];
+}
+
+function parseFunctionArgs(rawArgs?: string) {
+  if (!rawArgs) return {};
+
+  try {
+    return JSON.parse(rawArgs) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+function buildToolMessages(toolCalls: OpenAIFunctionCall[], toolResults: any[]) {
+  const assistantToolCallMessage = {
+    role: "assistant",
+    content: null,
+    tool_calls: toolCalls.map((toolCall) => ({
+      id: toolCall.id,
+      type: "function",
+      function: {
+        name: toolCall.function?.name,
+        arguments: toolCall.function?.arguments || "{}",
+      },
+    })),
+  };
+
+  const toolMessages = toolCalls.map((toolCall, index) => ({
+    role: "tool",
+    tool_call_id: toolCall.id,
+    content: JSON.stringify(toolResults[index] || {}),
+  }));
+
+  return [assistantToolCallMessage, ...toolMessages];
 }
 
 function inferDateFromMessage(message: string, today: string) {
   const normalized = normalizeText(message);
   if (normalized.includes("hom nay")) return today;
   return today;
+}
+
+function inferEmployeeNameFromMessage(message: string) {
+  const trimmedMessage = message.trim();
+
+  const explicitEmployee = message.match(/nhân viên\s+(.+?)(?:\s+hôm nay|\s+ngày|\s+từ|\s+lúc|\s+ca|\s+chi nhánh|\?|$)/i);
+  if (explicitEmployee?.[1]) {
+    const candidate = explicitEmployee[1].trim();
+    if (isLikelyEmployeeName(candidate)) return candidate;
+  }
+
+  const forPerson = message.match(/cho\s+(.+?)(?:\s+hôm nay|\s+ngày|\s+từ|\s+lúc|\s+ca|\?|$)/i);
+  if (forPerson?.[1]) {
+    const candidate = forPerson[1].trim();
+    if (isLikelyEmployeeName(candidate)) return candidate;
+  }
+
+  const ofPerson = message.match(/của\s+(.+?)(?:\s+hôm nay|\s+ngày|\s+từ|\s+lúc|\s+ca|\?|$)/i);
+  if (ofPerson?.[1]) {
+    const candidate = ofPerson[1].trim();
+    if (isLikelyEmployeeName(candidate)) return candidate;
+  }
+
+  const trailingName = message.match(/(?:cho tôi|giúp tôi|dùm tôi|đi)\s+([A-Za-zÀ-ỹ][A-Za-zÀ-ỹ\s]{1,60})$/i);
+  if (trailingName?.[1]) {
+    const candidate = trailingName[1].trim();
+    if (isLikelyEmployeeName(candidate)) return candidate;
+  }
+
+  const endingName = message.match(/(?:\s|^)([A-Za-zÀ-ỹ]+(?:\s+[A-Za-zÀ-ỹ]+){1,4})$/i);
+  if (endingName?.[1]) {
+    const candidate = endingName[1].trim();
+    if (isLikelyEmployeeName(candidate)) return candidate;
+  }
+
+  if (trimmedMessage.length > 0 && isLikelyEmployeeName(trimmedMessage)) {
+    return trimmedMessage;
+  }
+
+  return undefined;
+}
+
+function isLikelyEmployeeName(candidate: string) {
+  const normalized = normalizeText(candidate);
+  if (!normalized) return false;
+
+  const blockedPhrases = [
+    "nhan vien",
+    "lam",
+    "ca",
+    "toi",
+    "hom nay",
+    "ngay mai",
+    "chi nhanh",
+    "tu",
+    "den",
+    "sang",
+    "chieu",
+    "nguoi do",
+    "nguoi nay",
+    "ban ay",
+    "ban do",
+    "cho toi",
+    "giup toi",
+    "dum toi",
+    "sua ca",
+    "doi ca",
+  ];
+
+  if (blockedPhrases.some((phrase) => normalized === phrase || normalized.includes(`${phrase} `) || normalized.endsWith(` ${phrase}`))) {
+    return false;
+  }
+
+  if (normalized.length < 2) return false;
+  return true;
+}
+
+function inferShiftTimesFromMessage(message: string) {
+  const compact = message.match(/(\d{1,2})[:h](\d{2})?\s*(?:-|đến|toi|tới|den)\s*(\d{1,2})[:h](\d{2})?/i);
+  if (!compact) return undefined;
+
+  const startHour = compact[1].padStart(2, "0");
+  const startMinute = (compact[2] || "00").padStart(2, "0");
+  const endHour = compact[3].padStart(2, "0");
+  const endMinute = (compact[4] || "00").padStart(2, "0");
+
+  return {
+    start_time: `${startHour}:${startMinute}`,
+    end_time: `${endHour}:${endMinute}`,
+    shift_type: "FULL_TIME_8H" as const,
+  };
+}
+
+function inferSingleTimeFromMessage(message: string) {
+  const match = message.match(/(?:từ|luc|lúc|tu)\s*(\d{1,2})[:h](\d{2})?/i);
+  if (!match) return undefined;
+  return `${match[1].padStart(2, "0")}:${(match[2] || "00").padStart(2, "0")}`;
+}
+
+function inferEmployeeNameFromAssistantContext(messages: ChatMessage[]) {
+  const assistantHistory = messages
+    .filter((item) => item.role === "assistant" && item.content)
+    .map((item) => item.content!.trim())
+    .reverse();
+
+  for (const content of assistantHistory) {
+    const numberedMatches = [...content.matchAll(/\d+\.\s+(.+?)(?:\s+-\s+\d{4}-\d{2}-\d{2}|\s+\(\d{2}:\d{2}-\d{2}:\d{2}\)|$)/g)];
+    if (numberedMatches.length === 1) {
+      const candidate = numberedMatches[0][1]?.trim();
+      if (candidate && isLikelyEmployeeName(candidate)) return candidate;
+    }
+
+    const singleShiftMatch = content.match(/cho:\s+\*\*(.+?)\*\*/i);
+    if (singleShiftMatch?.[1] && isLikelyEmployeeName(singleShiftMatch[1].trim())) {
+      return singleShiftMatch[1].trim();
+    }
+  }
+
+  return undefined;
+}
+
+function buildMutationPatchFromMessage(
+  message: string,
+  messages: ChatMessage[],
+): Partial<MutationPayload> | null {
+  const inferredName = inferEmployeeNameFromMessage(message) || inferEmployeeNameFromAssistantContext(messages);
+  const inferredTimes = inferShiftTimesFromMessage(message);
+  const normalized = normalizeText(message);
+  const refersToPreviousPerson =
+    normalized.includes("nguoi do") ||
+    normalized.includes("nguoi nay") ||
+    normalized.includes("ban ay") ||
+    normalized.includes("ban do");
+  const contextualName = refersToPreviousPerson ? inferEmployeeNameFromAssistantContext(messages) : undefined;
+  const resolvedName = inferEmployeeNameFromMessage(message) || contextualName;
+
+  if (!resolvedName && !inferredTimes) return null;
+
+  return {
+    employee_names: resolvedName ? [resolvedName] : [],
+    shift_details: inferredTimes,
+  };
+}
+
+function findLatestDiscussedMutation(messages: ChatMessage[], today: string) {
+  const history = messages
+    .filter((item) => item.role === "user" && item.content)
+    .map((item) => item.content!.trim())
+    .reverse();
+
+  for (const content of history) {
+    const normalized = normalizeText(content);
+    if (includesAny(content, CONFIRM_PHRASES) || includesAny(content, CANCEL_PHRASES)) continue;
+    if (normalized === "confirm" || normalized === "cancel") continue;
+    const payload = extractMutationFromMessage(content, today);
+    if (payload) return payload;
+  }
+
+  return null;
+}
+
+function mergeWithPreviousMutation(
+  current: MutationPayload | null,
+  previous: MutationPayload | null,
+  patch?: Partial<MutationPayload> | null,
+): MutationPayload | null {
+  if (!current && previous && patch) {
+    return {
+      action: previous.action,
+      date: previous.date,
+      employee_names: patch.employee_names?.length ? patch.employee_names : previous.employee_names,
+      shift_details: {
+        start_time: patch.shift_details?.start_time || previous.shift_details?.start_time,
+        end_time: patch.shift_details?.end_time || previous.shift_details?.end_time,
+        shift_type: patch.shift_details?.shift_type || previous.shift_details?.shift_type || "FULL_TIME_8H",
+      },
+    };
+  }
+
+  if (!current) return previous;
+  if (!previous) return current;
+
+  return {
+    action: current.action,
+    date: current.date || previous.date,
+    employee_names: current.employee_names.length > 0 ? current.employee_names : previous.employee_names,
+    shift_details: {
+      start_time: current.shift_details?.start_time || previous.shift_details?.start_time,
+      end_time: current.shift_details?.end_time || previous.shift_details?.end_time,
+      shift_type: current.shift_details?.shift_type || previous.shift_details?.shift_type || "FULL_TIME_8H",
+    },
+  };
 }
 
 async function executeQuery(
@@ -281,7 +672,7 @@ async function executeQuery(
   const branchMap = Object.fromEntries((branchList || []).map((b: any) => [b.id, b.branch_name]));
 
   if (queryType === "shifts") {
-    let query = supabaseAdmin.from("shifts").select("id, user_id, shift_date, start_time, end_time, shift_type");
+    let query = supabaseAdmin.from("shifts").select("id, user_id, shift_date, start_time, end_time, shift_type, actual_branch_id");
     if (date) query = query.eq("shift_date", date);
     if (dateFrom) query = query.gte("shift_date", dateFrom);
     if (dateTo) query = query.lte("shift_date", dateTo);
@@ -295,10 +686,11 @@ async function executeQuery(
 
     let result = shifts.map((s: any) => {
       const p = profileMap[s.user_id] || {};
+      const resolvedBranchId = s.actual_branch_id || p.branch_id || null;
       return {
         name: p.name || "Không rõ",
-        branch: branchMap[p.branch_id] || "Chưa phân chi nhánh",
-        branch_id: p.branch_id,
+        branch: branchMap[resolvedBranchId] || "Chưa phân chi nhánh",
+        branch_id: resolvedBranchId,
         date: s.shift_date,
         start: s.start_time?.slice(0, 5),
         end: s.end_time?.slice(0, 5),
@@ -406,12 +798,34 @@ async function executeQuery(
     return { count: result.length, data: result };
   }
 
+  if (queryType === "branches") {
+    const { data: profiles } = await supabaseAdmin.from("profiles").select("user_id, branch_id, name");
+    const counts = new Map<string, number>();
+    for (const profile of profiles || []) {
+      if (!profile.branch_id) continue;
+      counts.set(profile.branch_id, (counts.get(profile.branch_id) || 0) + 1);
+    }
+
+    let result = (branchList || []).map((branch: any) => ({
+      id: branch.id,
+      branch_name: branch.branch_name,
+      employee_count: counts.get(branch.id) || 0,
+    }));
+
+    if (callerRole === "HR" && callerBranchId) {
+      result = result.filter((branch: any) => branch.id === callerBranchId);
+    }
+
+    return { count: result.length, data: result };
+  }
+
   return { error: "Loại truy vấn không hợp lệ." };
 }
 
 async function executeMutation(
   args: Record<string, unknown>,
   supabaseAdmin: ReturnType<typeof createClient>,
+  actor: ActorContext,
 ) {
   const action = args.action as string;
   const date = args.date as string;
@@ -429,15 +843,39 @@ async function executeMutation(
     else notFound.push(inputName);
   }
 
+  if (actor.callerRole === "HR" && actor.callerBranchId) {
+    const outOfBranch = matched.filter((emp) => emp.branch_id !== actor.callerBranchId);
+    if (outOfBranch.length > 0) {
+      return {
+        error: `Bạn chỉ được thay đổi ca cho nhân viên thuộc chi nhánh của mình. Không hợp lệ: ${outOfBranch.map((emp) => emp.name).join(", ")}`,
+      };
+    }
+  }
+
   if (action === "delete_shifts") {
     const deleted: string[] = [];
     const noShift: string[] = [];
 
     for (const emp of matched) {
-      const { data: existing } = await supabaseAdmin.from("shifts").select("id").eq("user_id", emp.user_id).eq("shift_date", date);
+      const { data: existing } = await supabaseAdmin
+        .from("shifts")
+        .select("id, start_time, end_time")
+        .eq("user_id", emp.user_id)
+        .eq("shift_date", date);
       if (existing && existing.length > 0) {
         await supabaseAdmin.from("shifts").delete().eq("user_id", emp.user_id).eq("shift_date", date);
         deleted.push(emp.name);
+        for (const shift of existing) {
+          await sendShiftCancelledEmail(
+            supabaseAdmin,
+            emp,
+            date,
+            String(shift.start_time),
+            String(shift.end_time),
+            actor,
+            "Ca làm đã được cập nhật từ Trợ lý AI HR",
+          );
+        }
       } else {
         noShift.push(emp.name);
       }
@@ -464,12 +902,61 @@ async function executeMutation(
           start_time: startTime,
           end_time: endTime,
           shift_type: shiftType,
+          actual_branch_id: actor.callerRole === "HR" ? actor.callerBranchId : (emp.branch_id || null),
         });
         added.push(emp.name);
+        await sendShiftAssignedEmail(supabaseAdmin, emp, date, startTime, endTime, actor);
       }
     }
 
-    return { action: "add_shifts", added, already_exists: alreadyExists, not_found: notFound, date };
+    return { action: "add_shifts", added, already_exists: alreadyExists, not_found: notFound, date, start_time: startTime, end_time: endTime };
+  }
+
+  if (action === "update_shifts") {
+    const updated: string[] = [];
+    const noShift: string[] = [];
+    const startTime = shiftDetails?.start_time || "08:00";
+    const endTime = shiftDetails?.end_time || "17:00";
+    const shiftType = shiftDetails?.shift_type || "FULL_TIME_8H";
+
+    for (const emp of matched) {
+      const { data: existing } = await supabaseAdmin
+        .from("shifts")
+        .select("id, start_time, end_time, actual_branch_id")
+        .eq("user_id", emp.user_id)
+        .eq("shift_date", date);
+      if (existing && existing.length > 0) {
+        for (const shift of existing) {
+          await sendShiftCancelledEmail(
+            supabaseAdmin,
+            emp,
+            date,
+            String(shift.start_time),
+            String(shift.end_time),
+            actor,
+            "Ca làm cũ đã được thay đổi từ Trợ lý AI HR",
+          );
+        }
+        await supabaseAdmin
+          .from("shifts")
+          .update({
+            start_time: startTime,
+            end_time: endTime,
+            shift_type: shiftType,
+            actual_branch_id: actor.callerRole === "HR"
+              ? actor.callerBranchId
+              : (existing[0]?.actual_branch_id || emp.branch_id || null),
+          })
+          .eq("user_id", emp.user_id)
+          .eq("shift_date", date);
+        updated.push(emp.name);
+        await sendShiftAssignedEmail(supabaseAdmin, emp, date, startTime, endTime, actor);
+      } else {
+        noShift.push(emp.name);
+      }
+    }
+
+    return { action: "update_shifts", updated, not_found: notFound, no_shift: noShift, date, start_time: startTime, end_time: endTime };
   }
 
   return { error: "Hành động không hợp lệ." };
@@ -481,6 +968,13 @@ function buildSummaryReplyFromQuery(message: string, result: QueryResult, today:
 
   if (normalized.includes("bao nhieu") && (normalized.includes("nguoi lam") || normalized.includes("người làm"))) {
     return `Hôm nay (${today}) có **${result.count || 0}** người có ca làm.`;
+  }
+
+  if ((normalized.includes("ca") || normalized.includes("lich") || normalized.includes("lịch")) && rows.length > 0) {
+    return [
+      `Tôi tìm thấy **${rows.length}** ca phù hợp:`,
+      ...rows.slice(0, 20).map((row: any, index: number) => `${index + 1}. ${row.name} - ${row.date} (${row.start}-${row.end})`),
+    ].join("\n");
   }
 
   if (normalized.includes("ca toi")) {
@@ -505,6 +999,22 @@ function buildSummaryReplyFromQuery(message: string, result: QueryResult, today:
     ].join("\n");
   }
 
+  if (normalized.includes("cham diem") || normalized.includes("chấm điểm") || normalized.includes("danh gia") || normalized.includes("đánh giá")) {
+    if (rows.length === 0) return "Hôm nay chưa có dữ liệu đánh giá.";
+    return [
+      `Có **${rows.length}** bản đánh giá phù hợp:` ,
+      ...rows.slice(0, 20).map((row: any, index: number) => `${index + 1}. ${row.name} - ${row.total_score} điểm (${row.date})`),
+    ].join("\n");
+  }
+
+  if (normalized.includes("chi nhanh") || normalized.includes("chi nhánh")) {
+    if (rows.length === 0) return "Không tìm thấy dữ liệu chi nhánh.";
+    return [
+      `Có **${rows.length}** chi nhánh trong phạm vi bạn được xem:`,
+      ...rows.slice(0, 20).map((row: any, index: number) => `${index + 1}. ${row.branch_name} - ${row.employee_count} nhân viên`),
+    ].join("\n");
+  }
+
   if (result.message) return result.message;
   if (typeof result.count === "number") return `Đã tìm thấy **${result.count}** kết quả.`;
 
@@ -514,13 +1024,13 @@ function buildSummaryReplyFromQuery(message: string, result: QueryResult, today:
 function inferFallbackIntent(message: string, role: string, today: string): { queryArgs?: Record<string, unknown>; reply?: string } {
   const normalized = normalizeText(message);
 
-  if (role !== "ADMIN" && (
+  if (!canMutate(role) && (
     normalized.includes("cho nghi") ||
     normalized.includes("them ca") ||
     normalized.includes("xoa ca") ||
     normalized.includes("sua ca")
   )) {
-    return { reply: "Bạn không có quyền thực hiện thay đổi dữ liệu. Vui lòng liên hệ Admin." };
+    return { reply: "Bạn không có quyền thực hiện thay đổi dữ liệu." };
   }
 
   if (normalized.includes("bao nhieu") && (normalized.includes("nguoi lam") || normalized.includes("người làm"))) {
@@ -532,15 +1042,53 @@ function inferFallbackIntent(message: string, role: string, today: string): { qu
   }
 
   if (normalized.includes("cham cong") || normalized.includes("chấm công") || normalized.includes("di muon") || normalized.includes("đi muộn")) {
-    return { queryArgs: { query_type: "attendance", date: today } };
+    return {
+      queryArgs: {
+        query_type: "attendance",
+        date: today,
+        employee_name: inferEmployeeNameFromMessage(message),
+      },
+    };
   }
 
   if (normalized.includes("danh gia") || normalized.includes("đánh giá")) {
-    return { queryArgs: { query_type: "evaluations", date_from: today, date_to: today } };
+    return {
+      queryArgs: {
+        query_type: "evaluations",
+        date_from: today,
+        date_to: today,
+        employee_name: inferEmployeeNameFromMessage(message),
+      },
+    };
+  }
+
+  if (normalized.includes("cham diem") || normalized.includes("chấm điểm")) {
+    return {
+      queryArgs: {
+        query_type: "evaluations",
+        date_from: today,
+        date_to: today,
+        employee_name: inferEmployeeNameFromMessage(message),
+      },
+    };
+  }
+
+  if (normalized.includes("ca") || normalized.includes("lich") || normalized.includes("lịch")) {
+    return {
+      queryArgs: {
+        query_type: "shifts",
+        date: today,
+        employee_name: inferEmployeeNameFromMessage(message),
+      },
+    };
   }
 
   if (normalized.includes("nhan vien") || normalized.includes("nhân viên")) {
     return { queryArgs: { query_type: "employees" } };
+  }
+
+  if (normalized.includes("chi nhanh") || normalized.includes("chi nhánh")) {
+    return { queryArgs: { query_type: "branches" } };
   }
 
   return {
@@ -550,25 +1098,52 @@ function inferFallbackIntent(message: string, role: string, today: string): { qu
 
 function extractMutationFromMessage(message: string, today: string): MutationPayload | null {
   const normalized = normalizeText(message);
+  const inferredName = inferEmployeeNameFromMessage(message);
+  const inferredTimes = inferShiftTimesFromMessage(message);
+  const inferredStart = inferSingleTimeFromMessage(message);
 
   if (normalized.includes("cho") && normalized.includes("nghi")) {
-    const employeeMatch = message.match(/nhân viên\s+(.+?)(?:\s+hôm nay|\s+ngày|\s*$)/i);
     return {
       action: "delete_shifts",
       date: inferDateFromMessage(message, today),
-      employee_names: employeeMatch?.[1] ? [employeeMatch[1].trim()] : [],
+      employee_names: inferredName ? [inferredName] : [],
     };
   }
 
-  if (normalized.includes("them ca")) {
-    const employeeMatch = message.match(/nhân viên\s+(.+?)(?:\s+hôm nay|\s+ngày|\s*$)/i);
+  if (normalized.includes("them ca") || normalized.includes("xep ca") || normalized.includes("xếp ca")) {
     return {
       action: "add_shifts",
       date: inferDateFromMessage(message, today),
-      employee_names: employeeMatch?.[1] ? [employeeMatch[1].trim()] : [],
-      shift_details: {
+      employee_names: inferredName ? [inferredName] : [],
+      shift_details: inferredTimes || {
         start_time: "08:00",
         end_time: "17:00",
+        shift_type: "FULL_TIME_8H",
+      },
+    };
+  }
+
+  if (normalized.includes("doi ca") || normalized.includes("đổi ca") || normalized.includes("sua ca") || normalized.includes("sửa ca")) {
+    return {
+      action: "update_shifts",
+      date: inferDateFromMessage(message, today),
+      employee_names: inferredName ? [inferredName] : [],
+      shift_details: inferredTimes || {
+        start_time: inferredStart || "08:00",
+        end_time: "17:00",
+        shift_type: "FULL_TIME_8H",
+      },
+    };
+  }
+
+  if (normalized.includes("sua lai") || normalized.includes("sửa lại") || normalized.includes("doi lai") || normalized.includes("đổi lại")) {
+    return {
+      action: "update_shifts",
+      date: inferDateFromMessage(message, today),
+      employee_names: inferredName ? [inferredName] : [],
+      shift_details: inferredTimes || {
+        start_time: inferredStart || "08:00",
+        end_time: "03:00",
         shift_type: "FULL_TIME_8H",
       },
     };
@@ -579,7 +1154,7 @@ function extractMutationFromMessage(message: string, today: string): MutationPay
 
 function summarizeMutationRequest(payload: MutationPayload) {
   if (!payload.employee_names.length) {
-    return "Tôi chưa xác định được nhân viên cần thay đổi. Hãy ghi rõ tên nhân viên.";
+    return "Tôi chưa xác định rõ nhân viên cần thay đổi. Hãy ghi rõ tên nhân viên, ví dụ: `Xếp ca cho nhân viên Nguyễn Văn A hôm nay từ 19h đến 3h`.";
   }
 
   if (payload.action === "delete_shifts") {
@@ -589,10 +1164,81 @@ function summarizeMutationRequest(payload: MutationPayload) {
   if (payload.action === "add_shifts") {
     const start = payload.shift_details?.start_time || "08:00";
     const end = payload.shift_details?.end_time || "17:00";
-    return `Tôi sẽ thêm ca làm ngày **${payload.date}** (${start}-${end}) cho: **${payload.employee_names.join(", ")}**.\n\nBạn có muốn xác nhận thay đổi này không?`;
+    return `Tôi sẽ thêm ca làm ngày **${payload.date}** từ **${start}** đến **${end}** cho: **${payload.employee_names.join(", ")}**.\n\nBạn có muốn xác nhận thay đổi này không?`;
+  }
+
+  if (payload.action === "update_shifts") {
+    const start = payload.shift_details?.start_time || "08:00";
+    const end = payload.shift_details?.end_time || "17:00";
+    return `Tôi sẽ cập nhật ca làm ngày **${payload.date}** thành **${start}-${end}** cho: **${payload.employee_names.join(", ")}**.\n\nBạn có muốn xác nhận thay đổi này không?`;
   }
 
   return "Tôi đã hiểu yêu cầu thay đổi. Bạn có muốn xác nhận thay đổi này không?";
+}
+
+function summarizeMutationResult(result: Record<string, unknown>) {
+  const action = result.action as string | undefined;
+  const date = result.date as string | undefined;
+  const startTime = result.start_time as string | undefined;
+  const endTime = result.end_time as string | undefined;
+
+  if (action === "add_shifts") {
+    const added = ((result.added as string[] | undefined) || []).filter(Boolean);
+    const alreadyExists = ((result.already_exists as string[] | undefined) || []).filter(Boolean);
+    const notFound = ((result.not_found as string[] | undefined) || []).filter(Boolean);
+
+    const lines = [];
+    if (added.length > 0) {
+      const timeRange = startTime && endTime ? ` (${startTime}-${endTime})` : "";
+      lines.push(`Đã thêm ca ngày **${date}**${timeRange} cho: **${added.join(", ")}**.`);
+    }
+    if (alreadyExists.length > 0) lines.push(`Tôi không thêm mới vì các nhân viên này đã có ca trong ngày: **${alreadyExists.join(", ")}**. Nếu muốn, bạn có thể yêu cầu tôi **sửa ca** cho họ.`);
+    if (notFound.length > 0) lines.push(`Không tìm thấy nhân viên: **${notFound.join(", ")}**.`);
+    return lines.join("\n\n") || "Đã xử lý yêu cầu thêm ca.";
+  }
+
+  if (action === "delete_shifts") {
+    const deleted = ((result.deleted as string[] | undefined) || []).filter(Boolean);
+    const noShift = ((result.no_shift as string[] | undefined) || []).filter(Boolean);
+    const notFound = ((result.not_found as string[] | undefined) || []).filter(Boolean);
+
+    const lines = [];
+    if (deleted.length > 0) lines.push(`Đã hủy ca ngày **${date}** cho: **${deleted.join(", ")}**.`);
+    if (noShift.length > 0) lines.push(`Các nhân viên này không có ca để hủy: **${noShift.join(", ")}**.`);
+    if (notFound.length > 0) lines.push(`Không tìm thấy nhân viên: **${notFound.join(", ")}**.`);
+    return lines.join("\n\n") || "Đã xử lý yêu cầu hủy ca.";
+  }
+
+  if (action === "update_shifts") {
+    const updated = ((result.updated as string[] | undefined) || []).filter(Boolean);
+    const noShift = ((result.no_shift as string[] | undefined) || []).filter(Boolean);
+    const notFound = ((result.not_found as string[] | undefined) || []).filter(Boolean);
+
+    const lines = [];
+    if (updated.length > 0) {
+      const timeRange = startTime && endTime ? ` thành **${startTime}-${endTime}**` : "";
+      lines.push(`Đã cập nhật ca ngày **${date}**${timeRange} cho: **${updated.join(", ")}**.`);
+    }
+    if (noShift.length > 0) lines.push(`Các nhân viên này chưa có ca để đổi: **${noShift.join(", ")}**.`);
+    if (notFound.length > 0) lines.push(`Không tìm thấy nhân viên: **${notFound.join(", ")}**.`);
+    return lines.join("\n\n") || "Đã xử lý yêu cầu đổi ca.";
+  }
+
+  return "Đã thực hiện thay đổi thành công.";
+}
+
+function findLatestMutationPayload(messages: ChatMessage[], today: string) {
+  const sourceMessage = messages
+    .filter((item) => item.role === "user" && item.content)
+    .map((item) => item.content!.trim())
+    .reverse()
+    .find((content) => {
+      const normalized = normalizeText(content);
+      if (includesAny(content, CONFIRM_PHRASES) || includesAny(content, CANCEL_PHRASES)) return false;
+      return Boolean(extractMutationFromMessage(content, today)) && normalized !== "confirm" && normalized !== "cancel";
+    });
+
+  return sourceMessage ? extractMutationFromMessage(sourceMessage, today) : null;
 }
 
 async function handleFallback(
@@ -601,39 +1247,52 @@ async function handleFallback(
   role: string,
   supabaseAdmin: ReturnType<typeof createClient>,
   callerBranchId: string | null,
+  actorName: string | null,
   today: string,
 ) {
   const pendingConfirmation = hasPendingConfirmation(messages.slice(0, -1));
+  const latestMutationPayload = findLatestMutationPayload(messages.slice(0, -1), today);
 
-  if (pendingConfirmation && role === "ADMIN") {
+  if ((pendingConfirmation || latestMutationPayload) && canMutate(role)) {
     if (includesAny(message, CANCEL_PHRASES)) {
       return { reply: "Đã hủy thay đổi theo yêu cầu của bạn.", mutations: false };
     }
 
     if (includesAny(message, CONFIRM_PHRASES)) {
-      const sourceMessage = messages
-        .slice(0, -1)
-        .filter((item) => item.role === "user" && item.content)
-        .map((item) => item.content!.trim())
-        .reverse()
-        .find((content) => extractMutationFromMessage(content, today));
-
-      const payload = sourceMessage ? extractMutationFromMessage(sourceMessage, today) : null;
+      const payload = latestMutationPayload;
       if (!payload || payload.employee_names.length === 0) {
         return { reply: "Không xác định được thay đổi cần thực hiện. Hãy gửi lại yêu cầu cụ thể hơn.", mutations: false };
       }
 
-      const result = await executeMutation(payload, supabaseAdmin);
+      const result = await executeMutation(payload, supabaseAdmin, { callerRole: role, callerBranchId, actorName });
       return {
-        reply: `Đã thực hiện thay đổi thành công.\n\n\`\`\`json\n${JSON.stringify(result, null, 2)}\n\`\`\``,
-        mutations: true,
+        reply: result.error
+          ? result.error
+          : summarizeMutationResult(result as Record<string, unknown>),
+        mutations: !result.error,
       };
     }
   }
 
-  if (role === "ADMIN") {
-    const mutationPayload = extractMutationFromMessage(message, today);
+  if (canMutate(role)) {
+    const rawMutationPayload = extractMutationFromMessage(message, today);
+    const mutationPatch = buildMutationPatchFromMessage(message, messages.slice(0, -1));
+    const mutationPayload = mergeWithPreviousMutation(rawMutationPayload, latestMutationPayload, mutationPatch);
     if (mutationPayload) {
+      if (!mutationPayload.employee_names.length) {
+        return {
+          reply: "Tôi chưa xác định rõ nhân viên cần thao tác. Hãy nói rõ tên nhân viên, ví dụ: `Sửa ca cho nhân viên Phạm Trọng hôm nay từ 20h đến 3h`.",
+          mutations: false,
+        };
+      }
+
+      if (mutationPayload.action === "update_shifts" && !rawMutationPayload?.shift_details?.start_time && !rawMutationPayload?.shift_details?.end_time) {
+        return {
+          reply: "Tôi hiểu bạn muốn sửa ca, nhưng chưa đủ giờ làm mới. Hãy nói rõ, ví dụ: `Sửa ca Phạm Trọng hôm nay từ 20h đến 3h`.",
+          mutations: false,
+        };
+      }
+
       return {
         reply: summarizeMutationRequest(mutationPayload),
         mutations: false,
@@ -680,116 +1339,126 @@ serve(async (req) => {
     const { data: roles } = await supabaseAdmin.from("user_roles").select("role").eq("user_id", user.id);
     const userRole = roles?.[0]?.role || "EMPLOYEE";
 
+    const requestBody = await req.json();
+    const { messages, conversation_id: rawConversationId } = requestBody || {};
+    const conversationId = typeof rawConversationId === "string" && rawConversationId.trim().length > 0
+      ? rawConversationId.trim()
+      : crypto.randomUUID();
+
     if (userRole === "EMPLOYEE") {
-      return jsonResponse({ error: "Chỉ Admin/HR mới có quyền sử dụng Trợ lý AI." }, 403);
+      return buildLoggedResponse(
+        { error: "Chỉ HR và Quản lý mới có quyền sử dụng Trợ lý AI." },
+        403,
+        null,
+        supabaseAdmin,
+      );
     }
 
-    const { data: callerProfile } = await supabaseAdmin.from("profiles").select("branch_id").eq("user_id", user.id).single();
+    const { data: callerProfile } = await supabaseAdmin.from("profiles").select("branch_id, name").eq("user_id", user.id).single();
     const callerBranchId = callerProfile?.branch_id || null;
-    const { messages } = await req.json();
+    const actorName = callerProfile?.name || null;
     const safeMessages = Array.isArray(messages) ? messages as ChatMessage[] : [];
     const currentMessage = latestUserMessage(safeMessages);
     const today = new Date().toISOString().split("T")[0];
+    const auditBase: ChatAuditPayload = {
+      conversationId,
+      userId: user.id,
+      userRole,
+      branchId: callerBranchId,
+      actorName,
+      userMessage: currentMessage,
+      assistantReply: "",
+      mutationsApplied: false,
+    };
+
+    // Deterministic confirmation path:
+    // if there is a pending mutation summary and user presses confirm/cancel,
+    // execute the fallback confirmation flow immediately instead of asking the model again.
+    if (hasPendingConfirmation(safeMessages.slice(0, -1)) && (includesAny(currentMessage, CONFIRM_PHRASES) || includesAny(currentMessage, CANCEL_PHRASES))) {
+      const confirmed = await handleFallback(currentMessage, safeMessages, userRole, supabaseAdmin, callerBranchId, actorName, today);
+      return buildLoggedResponse({ ...confirmed, role: userRole, mode: "confirmation" }, 200, auditBase, supabaseAdmin);
+    }
 
     const rateLimit = await enforceAiChatRateLimit(supabaseAdmin, user.id, currentMessage);
     if (!rateLimit.allowed) {
-      return jsonResponse({
-        error: `Báº¡n gá»­i yÃªu cáº§u quÃ¡ nhanh. Vui lÃ²ng Ä‘á»£i khoáº£ng ${AI_CHAT_WINDOW_SECONDS} giÃ¢y rá»“i thá»­ láº¡i.`,
-      }, 429);
+      return buildLoggedResponse({
+        error: `Bạn gửi yêu cầu quá nhanh. Vui lòng đợi khoảng ${AI_CHAT_WINDOW_SECONDS} giây rồi thử lại.`,
+      }, 429, auditBase, supabaseAdmin);
     }
 
-    const geminiApiKey = Deno.env.get("GEMINI_API_KEY");
-    if (!geminiApiKey) {
-      const fallback = await handleFallback(currentMessage, safeMessages, userRole, supabaseAdmin, callerBranchId, today);
-      return jsonResponse({ ...fallback, role: userRole, mode: "fallback" });
+    const openAiApiKey = Deno.env.get("OPENAI_API_KEY");
+    if (!openAiApiKey) {
+      const fallback = await handleFallback(currentMessage, safeMessages, userRole, supabaseAdmin, callerBranchId, actorName, today);
+      return buildLoggedResponse({ ...fallback, role: userRole, mode: "fallback" }, 200, auditBase, supabaseAdmin);
     }
 
     try {
       const systemPrompt = getSystemPrompt(userRole, today);
-      const contents = buildGeminiContents(safeMessages);
-      const tools = buildGeminiTools(userRole);
+      const messagesForOpenAI = buildOpenAIMessages(safeMessages, systemPrompt);
+      const tools = buildOpenAITools(userRole);
 
-      const data = await callGemini({
-        system_instruction: { parts: [{ text: systemPrompt }] },
-        contents,
+      const data = await callOpenAI({
+        model: OPENAI_MODEL,
+        messages: messagesForOpenAI,
         tools,
-      }, geminiApiKey);
+        tool_choice: "auto",
+      }, openAiApiKey);
 
-      const functionCalls = extractFunctionCallsFromGemini(data);
+      const functionCalls = extractFunctionCallsFromOpenAI(data);
       if (functionCalls.length === 0) {
-        return jsonResponse({
-          reply: extractTextFromGemini(data) || "Xin lỗi, tôi chưa hiểu rõ yêu cầu.",
+        return buildLoggedResponse({
+          reply: extractTextFromOpenAI(data) || "Xin lỗi, tôi chưa hiểu rõ yêu cầu.",
           mutations: false,
           role: userRole,
-          mode: "gemini",
-        });
+          mode: "openai",
+        }, 200, auditBase, supabaseAdmin);
       }
 
       const toolResults: any[] = [];
       let hasMutation = false;
 
       for (const functionCall of functionCalls) {
-        const args = functionCall.args || {};
+        const functionName = functionCall.function?.name || "";
+        const args = parseFunctionArgs(functionCall.function?.arguments);
 
-        if (functionCall.name === "query_hr_data") {
+        if (functionName === "query_hr_data") {
           const result = await executeQuery(args, supabaseAdmin, callerBranchId, userRole);
-          toolResults.push({
-            role: "user",
-            parts: [{
-              functionResponse: {
-                name: functionCall.name,
-                response: { result },
-              },
-            }],
-          });
-        } else if (functionCall.name === "execute_shift_mutation") {
-          if (userRole !== "ADMIN") {
-            toolResults.push({
-              role: "user",
-              parts: [{
-                functionResponse: {
-                  name: functionCall.name,
-                  response: { error: "Bạn không có quyền thay đổi dữ liệu." },
-                },
-              }],
-            });
+          toolResults.push({ result });
+        } else if (functionName === "execute_shift_mutation") {
+          if (!canMutate(userRole)) {
+            toolResults.push({ error: "Bạn không có quyền thay đổi dữ liệu." });
           } else {
-            const result = await executeMutation(args, supabaseAdmin);
-            toolResults.push({
-              role: "user",
-              parts: [{
-                functionResponse: {
-                  name: functionCall.name,
-                  response: { result },
-                },
-              }],
-            });
-            hasMutation = true;
+            const result = await executeMutation(args, supabaseAdmin, { callerRole: userRole, callerBranchId, actorName });
+            toolResults.push({ result });
+            hasMutation = !result.error;
           }
         }
       }
 
-      const followData = await callGemini({
-        system_instruction: { parts: [{ text: systemPrompt }] },
-        contents: [...contents, data.candidates?.[0]?.content, ...toolResults].filter(Boolean),
+      const followData = await callOpenAI({
+        model: OPENAI_MODEL,
+        messages: [
+          ...messagesForOpenAI,
+          ...buildToolMessages(functionCalls, toolResults),
+        ],
         tools,
-      }, geminiApiKey);
+      }, openAiApiKey);
 
-      return jsonResponse({
-        reply: extractTextFromGemini(followData) || "Đã xử lý xong.",
+      return buildLoggedResponse({
+        reply: extractTextFromOpenAI(followData) || "Đã xử lý xong.",
         mutations: hasMutation,
         role: userRole,
-        mode: "gemini",
-      });
+        mode: "openai",
+      }, 200, auditBase, supabaseAdmin);
     } catch (error) {
-      console.error("Gemini flow failed, switching to fallback:", error);
-      const fallback = await handleFallback(currentMessage, safeMessages, userRole, supabaseAdmin, callerBranchId, today);
-      return jsonResponse({
+      console.error("OpenAI flow failed, switching to fallback:", error);
+      const fallback = await handleFallback(currentMessage, safeMessages, userRole, supabaseAdmin, callerBranchId, actorName, today);
+      return buildLoggedResponse({
         ...fallback,
         role: userRole,
         mode: "fallback",
-        warning: error instanceof Error ? error.message : "Gemini flow failed",
-      });
+        warning: error instanceof Error ? error.message : "OpenAI flow failed",
+      }, 200, auditBase, supabaseAdmin);
     }
   } catch (error) {
     console.error("ai-shift-assistant error:", error);
