@@ -5,19 +5,27 @@ import { Separator } from '@/components/ui/separator';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
-import { MapPin, MapPinOff, LocateFixed, AlertTriangle } from 'lucide-react';
+import { MapPin, MapPinOff, LocateFixed, AlertTriangle, ShieldAlert } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
 import { supabase } from '@/integrations/supabase/client';
 import { calculateDistance } from '@/lib/geo-utils';
 
 type PermissionStateLike = 'granted' | 'denied' | 'prompt' | 'unsupported';
 
+type GeoDiagnostics = {
+  permissionState: PermissionStateLike;
+  attemptedPositionLookup: boolean;
+  browserSupportsGeolocation: boolean;
+  browserSupportsPermissionsApi: boolean;
+  locationErrorCode?: number;
+};
+
 type GeoState =
   | { status: 'loading' }
   | { status: 'no_branch' }
   | { status: 'no_gps_config' }
-  | { status: 'denied' }
-  | { status: 'error'; message: string }
+  | { status: 'denied'; diagnostics: GeoDiagnostics }
+  | { status: 'error'; message: string; diagnostics: GeoDiagnostics }
   | {
       status: 'out_of_range';
       distance: number;
@@ -76,6 +84,68 @@ function getEffectiveAllowedRadius(baseRadius: number, accuracy: number) {
   return Math.round(baseRadius + bufferedAccuracy);
 }
 
+function getDiagnosticsMessage(diagnostics: GeoDiagnostics) {
+  if (!diagnostics.browserSupportsGeolocation) {
+    return 'Trình duyệt này không hỗ trợ định vị GPS.';
+  }
+
+  if (diagnostics.permissionState === 'denied') {
+    return 'Trình duyệt đang chặn quyền vị trí cho trang này.';
+  }
+
+  if (diagnostics.locationErrorCode === 1) {
+    return 'Trình duyệt hoặc hệ điều hành đang từ chối quyền vị trí.';
+  }
+
+  if (diagnostics.locationErrorCode === 2) {
+    return 'Trình duyệt đã được cho phép nhưng Windows hoặc thiết bị chưa trả được tọa độ GPS.';
+  }
+
+  if (diagnostics.locationErrorCode === 3) {
+    return 'Việc lấy vị trí bị quá thời gian. GPS hoặc dịch vụ vị trí của máy đang phản hồi không ổn định.';
+  }
+
+  if (diagnostics.permissionState === 'granted') {
+    return 'Trang đã có quyền vị trí, nhưng trình duyệt vẫn chưa lấy được tọa độ thật từ thiết bị.';
+  }
+
+  if (diagnostics.permissionState === 'prompt') {
+    return 'Trình duyệt chưa xác nhận quyền vị trí cho lần truy cập này.';
+  }
+
+  return 'Không lấy được vị trí từ trình duyệt hoặc hệ điều hành.';
+}
+
+function GeoDiagnosticsPanel({ diagnostics }: { diagnostics: GeoDiagnostics }) {
+  const lines = [
+    `Quyền vị trí của trang: ${diagnostics.permissionState}`,
+    `Trình duyệt hỗ trợ GPS: ${diagnostics.browserSupportsGeolocation ? 'có' : 'không'}`,
+    `Permissions API: ${diagnostics.browserSupportsPermissionsApi ? 'có' : 'không'}`,
+  ];
+
+  if (diagnostics.locationErrorCode != null) {
+    lines.push(`Mã lỗi định vị: ${diagnostics.locationErrorCode}`);
+  }
+
+  return (
+    <div className="w-full rounded-lg border border-border/60 bg-muted/30 p-3 text-left text-xs text-muted-foreground">
+      <div className="mb-2 flex items-center gap-2 font-medium text-foreground">
+        <ShieldAlert className="h-4 w-4" />
+        <span>Chẩn đoán GPS</span>
+      </div>
+      <ul className="space-y-1">
+        {lines.map((line) => (
+          <li key={line}>{line}</li>
+        ))}
+      </ul>
+      <p className="mt-3">
+        Nếu quyền của trang đã là <span className="font-medium text-foreground">granted</span> nhưng vẫn lỗi,
+        hãy kiểm tra Windows <span className="font-medium text-foreground">Location services</span>.
+      </p>
+    </div>
+  );
+}
+
 export default function CheckInPage() {
   const { user } = useAuth();
   const [geo, setGeo] = useState<GeoState>({ status: 'loading' });
@@ -84,7 +154,7 @@ export default function CheckInPage() {
     if (!user) return;
     setGeo({ status: 'loading' });
 
-    const branchId = (user as any).branch_id;
+    const branchId = (user as { branch_id?: string | null }).branch_id;
     if (!branchId) {
       setGeo({ status: 'no_branch' });
       return;
@@ -106,18 +176,31 @@ export default function CheckInPage() {
     const allowedRadius = (branch.allowed_radius_meters as number) || 50;
     const branchName = branch.branch_name;
 
+    const diagnostics: GeoDiagnostics = {
+      permissionState: 'unsupported',
+      attemptedPositionLookup: false,
+      browserSupportsGeolocation: 'geolocation' in navigator,
+      browserSupportsPermissionsApi: 'permissions' in navigator && !!navigator.permissions?.query,
+    };
+
     if (!navigator.geolocation) {
-      setGeo({ status: 'error', message: 'Trình duyệt này không hỗ trợ định vị GPS.' });
+      setGeo({
+        status: 'error',
+        message: 'Trình duyệt này không hỗ trợ định vị GPS.',
+        diagnostics,
+      });
       return;
     }
 
-    const permissionState = await getLocationPermissionState();
-    if (permissionState === 'denied') {
-      setGeo({ status: 'denied' });
+    diagnostics.permissionState = await getLocationPermissionState();
+
+    if (diagnostics.permissionState === 'denied') {
+      setGeo({ status: 'denied', diagnostics });
       return;
     }
 
     try {
+      diagnostics.attemptedPositionLookup = true;
       const pos = await resolveDevicePosition();
       const distance = Math.round(
         calculateDistance(pos.coords.latitude, pos.coords.longitude, branchLat, branchLng),
@@ -139,23 +222,17 @@ export default function CheckInPage() {
       }
     } catch (error) {
       const err = error as GeolocationPositionError;
+      diagnostics.locationErrorCode = err?.code;
 
       if (err?.code === err.PERMISSION_DENIED) {
-        setGeo({ status: 'denied' });
-        return;
-      }
-
-      if (err?.code === err.POSITION_UNAVAILABLE) {
-        setGeo({
-          status: 'error',
-          message: 'Điện thoại chưa lấy được GPS. Hãy bật Vị trí chính xác hoặc di chuyển ra nơi tín hiệu tốt hơn rồi thử lại.',
-        });
+        setGeo({ status: 'denied', diagnostics });
         return;
       }
 
       setGeo({
         status: 'error',
-        message: 'Lấy vị trí bị quá thời gian hoặc GPS không ổn định. Hãy bật Vị trí chính xác rồi thử lại.',
+        message: getDiagnosticsMessage(diagnostics),
+        diagnostics,
       });
     }
   }, [user]);
@@ -169,10 +246,10 @@ export default function CheckInPage() {
       <div className="mx-auto max-w-lg space-y-5">
         <Card>
           <CardContent className="flex flex-col items-center gap-4 py-12">
-            <div className="rounded-full bg-muted p-4 animate-pulse">
+            <div className="animate-pulse rounded-full bg-muted p-4">
               <LocateFixed className="h-8 w-8 text-primary" />
             </div>
-            <div className="text-center space-y-1">
+            <div className="space-y-1 text-center">
               <p className="font-medium text-foreground">Đang kiểm tra vị trí làm việc...</p>
               <p className="text-sm text-muted-foreground">Vui lòng cho phép quyền truy cập vị trí</p>
             </div>
@@ -197,6 +274,7 @@ export default function CheckInPage() {
                 Mở cài đặt trình duyệt rồi cho phép vị trí cho trang này, sau đó thử lại.
               </p>
             </div>
+            <GeoDiagnosticsPanel diagnostics={geo.diagnostics} />
             <Button variant="outline" onClick={checkLocation} className="gap-2">
               <LocateFixed className="h-4 w-4" /> Thử lại vị trí
             </Button>
@@ -215,6 +293,7 @@ export default function CheckInPage() {
               <MapPinOff className="h-8 w-8 text-destructive" />
             </div>
             <p className="font-semibold text-foreground">{geo.message}</p>
+            <GeoDiagnosticsPanel diagnostics={geo.diagnostics} />
             <Button variant="outline" onClick={checkLocation} className="gap-2">
               <LocateFixed className="h-4 w-4" /> Thử lại vị trí
             </Button>
@@ -237,7 +316,7 @@ export default function CheckInPage() {
               <p className="text-sm text-foreground">
                 Vui lòng di chuyển đến <span className="font-semibold">{geo.branchName}</span>.
               </p>
-              <p className="text-sm text-muted-foreground mt-2">
+              <p className="mt-2 text-sm text-muted-foreground">
                 Cách quán: <span className="font-bold text-destructive">{geo.distance}m</span>
                 <span className="mx-1">•</span>
                 Bán kính gốc: {geo.allowedRadius}m
@@ -263,12 +342,12 @@ export default function CheckInPage() {
     <div className="mx-auto max-w-lg space-y-5">
       <div>
         <h2 className="text-xl font-semibold text-foreground">Chấm công hàng ngày</h2>
-        <p className="text-sm text-muted-foreground mt-1">Chụp ảnh điểm danh cho hôm nay</p>
+        <p className="mt-1 text-sm text-muted-foreground">Chụp ảnh điểm danh cho hôm nay</p>
       </div>
 
       {showLocationBadge && (
         <div className="flex items-center gap-2 rounded-lg border border-green-500/30 bg-green-500/5 px-3 py-2 text-sm">
-          <MapPin className="h-4 w-4 text-green-600 shrink-0" />
+          <MapPin className="h-4 w-4 shrink-0 text-green-600" />
           <span className="text-green-700">
             Trong phạm vi chấm công ({geo.distance}m, sai số GPS khoảng {geo.accuracy}m)
           </span>
@@ -277,7 +356,7 @@ export default function CheckInPage() {
 
       {geo.status === 'no_branch' && (
         <div className="flex items-center gap-2 rounded-lg border border-yellow-500/30 bg-yellow-500/5 px-3 py-2 text-sm">
-          <AlertTriangle className="h-4 w-4 text-yellow-600 shrink-0" />
+          <AlertTriangle className="h-4 w-4 shrink-0 text-yellow-600" />
           <span className="text-yellow-700">Chưa được gán chi nhánh. Liên hệ quản lý.</span>
         </div>
       )}
@@ -288,7 +367,7 @@ export default function CheckInPage() {
       />
       <Separator />
       <div>
-        <h3 className="text-sm font-semibold text-foreground mb-4">Tuần này</h3>
+        <h3 className="mb-4 text-sm font-semibold text-foreground">Tuần này</h3>
         <CheckInHistory />
       </div>
     </div>
