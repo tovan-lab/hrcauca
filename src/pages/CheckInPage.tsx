@@ -18,8 +18,20 @@ type GeoState =
   | { status: 'no_gps_config' }
   | { status: 'denied' }
   | { status: 'error'; message: string }
-  | { status: 'out_of_range'; distance: number; branchName: string; allowedRadius: number }
-  | { status: 'in_range'; distance: number };
+  | {
+      status: 'out_of_range';
+      distance: number;
+      branchName: string;
+      allowedRadius: number;
+      accuracy: number;
+      effectiveRadius: number;
+    }
+  | {
+      status: 'in_range';
+      distance: number;
+      accuracy: number;
+      effectiveRadius: number;
+    };
 
 function getCurrentPositionWithOptions(options: PositionOptions) {
   return new Promise<GeolocationPosition>((resolve, reject) => {
@@ -56,6 +68,12 @@ async function resolveDevicePosition() {
   }
 
   throw lastError || new Error('Unable to resolve position');
+}
+
+function getEffectiveAllowedRadius(baseRadius: number, accuracy: number) {
+  const safeAccuracy = Number.isFinite(accuracy) ? Math.max(0, accuracy) : 0;
+  const bufferedAccuracy = Math.min(safeAccuracy, 120);
+  return Math.round(baseRadius + bufferedAccuracy);
 }
 
 export default function CheckInPage() {
@@ -101,13 +119,23 @@ export default function CheckInPage() {
 
     try {
       const pos = await resolveDevicePosition();
-      const dist = calculateDistance(pos.coords.latitude, pos.coords.longitude, branchLat, branchLng);
-      const rounded = Math.round(dist);
+      const distance = Math.round(
+        calculateDistance(pos.coords.latitude, pos.coords.longitude, branchLat, branchLng),
+      );
+      const accuracy = Math.round(pos.coords.accuracy || 0);
+      const effectiveRadius = getEffectiveAllowedRadius(allowedRadius, accuracy);
 
-      if (rounded <= allowedRadius) {
-        setGeo({ status: 'in_range', distance: rounded });
+      if (distance <= effectiveRadius) {
+        setGeo({ status: 'in_range', distance, accuracy, effectiveRadius });
       } else {
-        setGeo({ status: 'out_of_range', distance: rounded, branchName, allowedRadius });
+        setGeo({
+          status: 'out_of_range',
+          distance,
+          branchName,
+          allowedRadius,
+          accuracy,
+          effectiveRadius,
+        });
       }
     } catch (error) {
       const err = error as GeolocationPositionError;
@@ -212,7 +240,12 @@ export default function CheckInPage() {
               <p className="text-sm text-muted-foreground mt-2">
                 Cách quán: <span className="font-bold text-destructive">{geo.distance}m</span>
                 <span className="mx-1">•</span>
-                Cho phép: {geo.allowedRadius}m
+                Bán kính gốc: {geo.allowedRadius}m
+              </p>
+              <p className="text-sm text-muted-foreground">
+                Sai số GPS máy này: khoảng {geo.accuracy}m
+                <span className="mx-1">•</span>
+                Bán kính áp dụng: {geo.effectiveRadius}m
               </p>
             </div>
             <Button variant="outline" onClick={checkLocation} className="gap-2">
@@ -236,7 +269,9 @@ export default function CheckInPage() {
       {showLocationBadge && (
         <div className="flex items-center gap-2 rounded-lg border border-green-500/30 bg-green-500/5 px-3 py-2 text-sm">
           <MapPin className="h-4 w-4 text-green-600 shrink-0" />
-          <span className="text-green-700">Trong phạm vi chấm công ({geo.distance}m)</span>
+          <span className="text-green-700">
+            Trong phạm vi chấm công ({geo.distance}m, sai số GPS khoảng {geo.accuracy}m)
+          </span>
         </div>
       )}
 
