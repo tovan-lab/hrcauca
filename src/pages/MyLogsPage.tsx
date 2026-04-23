@@ -8,6 +8,7 @@ import { Clock, CheckCircle2, AlertTriangle } from 'lucide-react';
 import { format } from 'date-fns';
 import { vi } from 'date-fns/locale';
 import { getSignedImageUrls } from '@/lib/signed-urls';
+import { formatMinutesAsHours } from '@/lib/duration';
 
 interface LogEntry {
   id: string;
@@ -22,10 +23,26 @@ interface LogEntry {
 }
 
 const STATUS_CONFIG: Record<string, { label: string; color: string; icon: React.ElementType }> = {
-  on_time: { label: 'Đúng giờ', color: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400', icon: CheckCircle2 },
-  late: { label: 'Trễ', color: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400', icon: AlertTriangle },
-  early_leave: { label: 'Về sớm', color: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400', icon: AlertTriangle },
-  late_and_early: { label: 'Trễ & Về sớm', color: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400', icon: AlertTriangle },
+  on_time: {
+    label: 'Đúng giờ',
+    color: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
+    icon: CheckCircle2,
+  },
+  late: {
+    label: 'Trễ',
+    color: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400',
+    icon: AlertTriangle,
+  },
+  early_leave: {
+    label: 'Về sớm',
+    color: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
+    icon: AlertTriangle,
+  },
+  late_and_early: {
+    label: 'Trễ & Về sớm',
+    color: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400',
+    icon: AlertTriangle,
+  },
 };
 
 export default function MyLogsPage() {
@@ -36,6 +53,7 @@ export default function MyLogsPage() {
 
   useEffect(() => {
     if (!user) return;
+
     const fetchLogs = async () => {
       setLoading(true);
       const { data } = await supabase
@@ -44,16 +62,19 @@ export default function MyLogsPage() {
         .eq('user_id', user.id)
         .order('check_in_time', { ascending: false })
         .limit(30);
+
       const entries = (data as LogEntry[]) || [];
       setLogs(entries);
-      // Resolve signed URLs
-      const urls = entries.map(e => e.image_url).filter(Boolean);
+
+      const urls = entries.map((entry) => entry.image_url).filter(Boolean);
       if (urls.length > 0) {
         const resolved = await getSignedImageUrls(urls);
         setSignedUrls(resolved);
       }
+
       setLoading(false);
     };
+
     fetchLogs();
   }, [user]);
 
@@ -61,12 +82,14 @@ export default function MyLogsPage() {
     <div className="space-y-6">
       <div>
         <h2 className="text-xl font-semibold text-foreground">Nhật ký của tôi</h2>
-        <p className="text-sm text-muted-foreground mt-1">Lịch sử chấm công cá nhân 30 ngày gần nhất</p>
+        <p className="mt-1 text-sm text-muted-foreground">Lịch sử chấm công cá nhân 30 ngày gần nhất</p>
       </div>
 
       {loading ? (
         <div className="space-y-3">
-          {Array.from({ length: 5 }).map((_, i) => <Skeleton key={i} className="h-20 w-full rounded-xl" />)}
+          {Array.from({ length: 5 }).map((_, index) => (
+            <Skeleton key={index} className="h-20 w-full rounded-xl" />
+          ))}
         </div>
       ) : logs.length === 0 ? (
         <Card>
@@ -76,7 +99,7 @@ export default function MyLogsPage() {
         </Card>
       ) : (
         <div className="space-y-3">
-          {logs.map(log => {
+          {logs.map((log) => {
             const status = STATUS_CONFIG[log.attendance_status || 'on_time'] || STATUS_CONFIG.on_time;
             const StatusIcon = status.icon;
 
@@ -85,33 +108,50 @@ export default function MyLogsPage() {
                 <CardContent className="p-0">
                   <div className="flex items-center gap-4 p-4">
                     {log.image_url ? (
-                      <img src={signedUrls.get(log.image_url) || ''} alt="" className="h-14 w-14 rounded-xl object-cover shrink-0" />
+                      <img
+                        src={signedUrls.get(log.image_url) || ''}
+                        alt=""
+                        className="h-14 w-14 shrink-0 rounded-xl object-cover"
+                      />
                     ) : (
-                      <div className="h-14 w-14 rounded-xl bg-muted flex items-center justify-center shrink-0">
+                      <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-xl bg-muted">
                         <Clock className="h-5 w-5 text-muted-foreground" />
                       </div>
                     )}
-                    <div className="flex-1 min-w-0">
+
+                    <div className="min-w-0 flex-1">
                       <p className="text-sm font-semibold">
                         {format(new Date(log.check_in_time), 'EEEE, dd/MM/yyyy', { locale: vi })}
                       </p>
-                      <div className="flex items-center gap-2 mt-1">
+
+                      <div className="mt-1 flex items-center gap-2">
                         <span className="text-xs text-muted-foreground">
                           Vào: {format(new Date(log.check_in_time), 'HH:mm')}
                         </span>
+
                         {log.check_out_time && (
                           <span className="text-xs text-muted-foreground">
                             • Ra: {format(new Date(log.check_out_time), 'HH:mm')}
                           </span>
                         )}
+
                         {(log.late_minutes ?? 0) > 0 && (
-                          <span className="text-xs text-red-500 font-medium">Trễ {log.late_minutes} phút</span>
+                          <span className="text-xs font-medium text-red-500">
+                            Trễ {formatMinutesAsHours(log.late_minutes)}
+                          </span>
+                        )}
+
+                        {(log.early_leave_minutes ?? 0) > 0 && (
+                          <span className="text-xs font-medium text-amber-600">
+                            • Về sớm {formatMinutesAsHours(log.early_leave_minutes)}
+                          </span>
                         )}
                       </div>
                     </div>
-                    <div className="flex flex-col items-end gap-1.5 shrink-0">
-                      <Badge variant="outline" className={`text-xs ${status.color} border-0`}>
-                        <StatusIcon className="h-3 w-3 mr-1" />
+
+                    <div className="flex shrink-0 flex-col items-end gap-1.5">
+                      <Badge variant="outline" className={`border-0 text-xs ${status.color}`}>
+                        <StatusIcon className="mr-1 h-3 w-3" />
                         {status.label}
                       </Badge>
                     </div>

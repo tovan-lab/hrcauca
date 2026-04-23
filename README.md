@@ -42,9 +42,30 @@ App mặc định chạy tại `http://localhost:8080`.
 
 - `npm run dev`: chạy môi trường phát triển
 - `npm run build`: build production
+- `npm run build:mobile`: build web để đóng gói app
 - `npm run preview`: xem bản build local
 - `npm run test`: chạy test
 - `npm run lint`: kiểm tra eslint
+
+## Đóng gói Android nội bộ
+
+Giai đoạn này giữ nguyên toàn bộ logic web, chỉ thêm lớp đóng gói bằng Capacitor.
+
+Các bước sau khi cài Capacitor:
+
+```bash
+npm install @capacitor/core @capacitor/cli
+npm run build:mobile
+npx cap add android
+npx cap sync
+npx cap open android
+```
+
+Lưu ý:
+
+- `capacitor.config.ts` đã trỏ `webDir` tới `dist`
+- web hiện tại vẫn chạy độc lập như cũ
+- thư mục `android/` chỉ được tạo khi bạn chạy `npx cap add android`
 
 ## Supabase
 

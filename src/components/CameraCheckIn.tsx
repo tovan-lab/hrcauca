@@ -14,6 +14,7 @@ import { supabase } from '@/integrations/supabase/client';
 import { format } from 'date-fns';
 import { compressImage } from '@/lib/image-compress';
 import { notifyHrByEmail } from '@/lib/notify-early-checkout';
+import { formatMinutesAsHours } from '@/lib/duration';
 
 interface TodayCheckIn {
   id: string;
@@ -571,7 +572,7 @@ export function CameraCheckIn({ geoAllowed = true, onRefreshLocation }: CameraCh
       setTimeout(() => setCaptured(false), 100);
       toast.success(
         `Da check-out luc ${now.toLocaleTimeString('vi-VN')}` +
-        (earlyLeaveMinutes > 0 ? ` (Ve som ${earlyLeaveMinutes} phut)` : '')
+        (earlyLeaveMinutes > 0 ? ` (Ve som ${formatMinutesAsHours(earlyLeaveMinutes)})` : '')
       );
     } catch (e: any) {
       toast.error('Loi khi check-out: ' + (e?.message || 'Vui long thu lai'));
@@ -734,9 +735,9 @@ export function CameraCheckIn({ geoAllowed = true, onRefreshLocation }: CameraCh
           {!canCheckoutNow && (
             <p className="text-xs text-muted-foreground text-center">
               {'Checkout se mo khi con '}
-              {EARLY_CHECKOUT_TOLERANCE_MIN}
-              {' phut cuoi ca.'}
-              {activeEarlyMinutes > 0 ? ' Con khoang ' + activeEarlyMinutes + ' phut.' : ''}
+              {formatMinutesAsHours(EARLY_CHECKOUT_TOLERANCE_MIN)}
+              {' cuoi ca.'}
+              {activeEarlyMinutes > 0 ? ' Con khoang ' + formatMinutesAsHours(activeEarlyMinutes) + '.' : ''}
             </p>
           )}
           {activeShiftEnded && (
@@ -821,8 +822,8 @@ export function CameraCheckIn({ geoAllowed = true, onRefreshLocation }: CameraCh
           <DialogHeader>
             <DialogTitle>Xin ve som</DialogTitle>
             <DialogDescription>
-              Ban dang ve som <span className="font-semibold text-destructive">{earlyMinutes} phut</span> so voi ca dang ky
-              (vuot nguong cho phep {EARLY_CHECKOUT_TOLERANCE_MIN} phut).
+              Ban dang ve som <span className="font-semibold text-destructive">{formatMinutesAsHours(earlyMinutes)}</span> so voi ca dang ky
+              (vuot nguong cho phep {formatMinutesAsHours(EARLY_CHECKOUT_TOLERANCE_MIN)}).
               Vui long nhap ly do de gui HR/Quan ly chi nhanh duyet.
             </DialogDescription>
           </DialogHeader>

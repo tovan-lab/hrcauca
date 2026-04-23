@@ -19,6 +19,7 @@ import { cn } from '@/lib/utils';
 import { toast } from 'sonner';
 import { getSignedImageUrls } from '@/lib/signed-urls';
 import AttendanceSummary from '@/components/AttendanceSummary';
+import { formatMinutesAsHours } from '@/lib/duration';
 
 interface CheckInRow {
   id: string;
@@ -347,9 +348,9 @@ export default function LogsPage() {
                           </Badge>
                         </TableCell>
                         <TableCell className="text-xs text-muted-foreground">
-                          {isLate && <span className="text-destructive">Trễ {ci.late_minutes}p</span>}
+                          {isLate && <span className="text-destructive">Trễ {formatMinutesAsHours(ci.late_minutes)}</span>}
                           {isLate && isEarly && ' • '}
-                          {isEarly && <span className="text-destructive">Sớm {ci.early_leave_minutes}p</span>}
+                          {isEarly && <span className="text-destructive">Về sớm {formatMinutesAsHours(ci.early_leave_minutes)}</span>}
                           {!isLate && !isEarly && '—'}
                         </TableCell>
                         <TableCell className="text-center">
