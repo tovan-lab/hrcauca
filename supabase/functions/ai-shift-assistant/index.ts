@@ -21,6 +21,8 @@ type ChatMessage = {
 type QueryResult = {
   count?: number;
   data?: any[];
+  missing_checkin?: any[];
+  scheduled_count?: number;
   message?: string;
   error?: string;
 };
@@ -238,6 +240,59 @@ async function sendShiftCancelledEmail(
   });
 }
 
+async function getItRecipients(
+  supabaseAdmin: ReturnType<typeof createClient>,
+) {
+  const { data, error } = await supabaseAdmin
+    .from("user_roles")
+    .select("user_id")
+    .eq("role", "IT");
+
+  if (error || !data?.length) {
+    console.error("Failed to load IT recipients:", error);
+    return [];
+  }
+
+  const userIds = data.map((item) => item.user_id).filter(Boolean);
+  const { data: profiles, error: profileError } = await supabaseAdmin
+    .from("profiles")
+    .select("user_id, email, name")
+    .in("user_id", userIds);
+
+  if (profileError) {
+    console.error("Failed to load IT recipient profiles:", profileError);
+    return [];
+  }
+
+  return (profiles ?? []).filter((profile) => profile.email);
+}
+
+async function notifyItUsersOpenAICreditExhausted(
+  supabaseAdmin: ReturnType<typeof createClient>,
+  actorName: string | null,
+  userRole: string,
+) {
+  const recipients = await getItRecipients(supabaseAdmin);
+  if (recipients.length === 0) return;
+
+  const happenedAt = new Date().toISOString();
+  const hourBucket = happenedAt.slice(0, 13);
+  const requesterRole = userRole === "ADMIN" ? "HR" : "Quản lý";
+
+  for (const recipient of recipients) {
+    await enqueueTransactionalEmail(supabaseAdmin, {
+      templateName: "ai-credit-exhausted-alert",
+      recipientEmail: recipient.email,
+      idempotencyKey: `ai-credit-exhausted-${recipient.user_id}-${hourBucket}`,
+      templateData: {
+        requesterName: actorName || "Không rõ",
+        requesterRole,
+        happenedAt,
+      },
+    });
+  }
+}
+
 async function enforceAiChatRateLimit(
   supabaseAdmin: ReturnType<typeof createClient>,
   userId: string,
@@ -298,6 +353,25 @@ async function logAiChatTurn(
   }
 }
 
+async function getSystemApiKey(
+  supabaseAdmin: ReturnType<typeof createClient>,
+  service: "openai" | "resend",
+) {
+  const { data, error } = await supabaseAdmin
+    .from("system_api_configs")
+    .select("api_key")
+    .eq("service", service)
+    .maybeSingle();
+
+  if (error) {
+    console.error(`Failed to load ${service} api key override:`, error);
+    return null;
+  }
+
+  const value = data?.api_key?.trim();
+  return value ? value : null;
+}
+
 function buildLoggedResponse(
   body: Record<string, unknown>,
   status: number,
@@ -340,6 +414,14 @@ function includesAny(text: string, phrases: string[]) {
 }
 
 function latestUserMessage(messages: ChatMessage[]) {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.role === "user" && message.content) return message.content.trim();
+  }
+  return "";
+}
+
+function previousUserMessage(messages: ChatMessage[]) {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i];
     if (message.role === "user" && message.content) return message.content.trim();
@@ -522,6 +604,18 @@ function buildToolMessages(toolCalls: OpenAIFunctionCall[], toolResults: any[]) 
   return [assistantToolCallMessage, ...toolMessages];
 }
 
+function isOpenAIQuotaError(error: unknown) {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+
+  return [
+    "insufficient_quota",
+    "billing_hard_limit_reached",
+    "exceeded your current quota",
+    "credit balance is too low",
+    "quota",
+  ].some((token) => message.includes(token));
+}
+
 function inferDateFromMessage(message: string, today: string) {
   const normalized = normalizeText(message);
   if (normalized.includes("hom nay")) return today;
@@ -623,6 +717,47 @@ function shouldUseDeterministicFallback(message: string, messages: ChatMessage[]
     normalized.includes("đánh giá nhân viên");
 
   return hasActiveEvaluationPrompt(messages) || startsEvaluation || (refersToPriorContext && mentionsMutation);
+}
+
+function isMissingCheckinIntent(message: string) {
+  const normalized = normalizeText(message);
+  return (
+    normalized.includes("khong checkin") ||
+    normalized.includes("khong check-in") ||
+    normalized.includes("khong cham cong") ||
+    normalized.includes("chua checkin") ||
+    normalized.includes("chua check-in") ||
+    normalized.includes("chua cham cong")
+  );
+}
+
+function isAttendanceNameFollowUp(message: string) {
+  const normalized = normalizeText(message);
+  return (
+    normalized.includes("gui ten") ||
+    normalized.includes("cho toi ten") ||
+    normalized.includes("liet ke ten") ||
+    normalized.includes("gui danh sach") ||
+    normalized.includes("danh sach ten")
+  );
+}
+
+function formatMissingCheckinReply(result: QueryResult, today: string, includeNames: boolean) {
+  const missingRows = (result.missing_checkin || []) as Array<{ name?: string }>;
+
+  if (missingRows.length === 0) {
+    return `Hôm nay (${today}) không có nhân viên nào bị thiếu check-in trong phạm vi tra cứu.`;
+  }
+
+  const lines = [`Hôm nay (${today}) có **${missingRows.length}** nhân viên chưa check-in.`];
+
+  if (includeNames || missingRows.length <= 10) {
+    lines.push(...missingRows.map((row, index) => `${index + 1}. ${row.name || "Không rõ"}`));
+  } else {
+    lines.push("Nếu cần danh sách tên, hãy nói: `gửi tên cho tôi`.");
+  }
+
+  return lines.join("\n");
 }
 
 function inferEmployeeNameFromMessage(message: string) {
@@ -922,13 +1057,33 @@ async function executeQuery(
     if (dateTo) query = query.lt("check_in_time", `${dateTo}T23:59:59`);
 
     const { data: checkins } = await query.limit(300);
-    if (!checkins || checkins.length === 0) return { count: 0, data: [], message: "Không tìm thấy dữ liệu chấm công." };
+    const effectiveDate = date || (dateFrom && dateFrom === dateTo ? dateFrom : null);
+    let scheduledShifts: any[] = [];
 
-    const userIds = [...new Set(checkins.map((c: any) => c.user_id))];
-    const { data: profiles } = await supabaseAdmin.from("profiles").select("user_id, name, branch_id").in("user_id", userIds);
+    if (effectiveDate) {
+      const { data: shifts } = await supabaseAdmin
+        .from("shifts")
+        .select("user_id, shift_date, start_time, end_time, actual_branch_id")
+        .eq("shift_date", effectiveDate);
+      scheduledShifts = shifts || [];
+    }
+
+    const profileUserIds = [...new Set([
+      ...((checkins || []).map((c: any) => c.user_id)),
+      ...scheduledShifts.map((shift: any) => shift.user_id),
+    ])];
+
+    if (profileUserIds.length === 0) {
+      return { count: 0, data: [], missing_checkin: [], message: "Không tìm thấy dữ liệu chấm công." };
+    }
+
+    const { data: profiles } = await supabaseAdmin
+      .from("profiles")
+      .select("user_id, name, branch_id")
+      .in("user_id", profileUserIds);
     const profileMap = Object.fromEntries((profiles || []).map((p: any) => [p.user_id, p]));
 
-    let result = checkins.map((c: any) => {
+    let result = (checkins || []).map((c: any) => {
       const p = profileMap[c.user_id] || {};
       return {
         name: p.name || "Không rõ",
@@ -947,7 +1102,40 @@ async function executeQuery(
       result = result.filter((r: any) => r.name.toLowerCase().includes(lower));
     }
 
-    return { count: result.length, data: result };
+    let missingCheckin = scheduledShifts
+      .filter((shift: any) => !(checkins || []).some((checkin: any) => checkin.user_id === shift.user_id))
+      .map((shift: any) => {
+        const profile = profileMap[shift.user_id] || {};
+        const resolvedBranchId = shift.actual_branch_id || profile.branch_id || null;
+
+        return {
+          user_id: shift.user_id,
+          name: profile.name || "Không rõ",
+          branch: branchMap[resolvedBranchId] || "Chưa phân chi nhánh",
+          branch_id: resolvedBranchId,
+          date: shift.shift_date,
+          start: shift.start_time?.slice(0, 5),
+          end: shift.end_time?.slice(0, 5),
+        };
+      });
+
+    if (callerRole === "HR" && callerBranchId) {
+      missingCheckin = missingCheckin.filter((row: any) => row.branch_id === callerBranchId);
+    }
+    if (branchId) {
+      missingCheckin = missingCheckin.filter((row: any) => row.branch_id === branchId);
+    }
+    if (employeeName) {
+      const lower = employeeName.toLowerCase();
+      missingCheckin = missingCheckin.filter((row: any) => row.name.toLowerCase().includes(lower));
+    }
+
+    return {
+      count: result.length,
+      data: result,
+      missing_checkin: missingCheckin,
+      scheduled_count: scheduledShifts.length,
+    };
   }
 
   if (queryType === "evaluations") {
@@ -1631,6 +1819,10 @@ function buildSummaryReplyFromQuery(message: string, result: QueryResult, today:
   const normalized = normalizeText(message);
   const rows = result.data || [];
 
+  if (isMissingCheckinIntent(message)) {
+    return formatMissingCheckinReply(result, today, false);
+  }
+
   if (
     normalized.includes("thang nay") ||
     normalized.includes("tháng này") ||
@@ -1724,6 +1916,10 @@ function buildSummaryReplyFromQuery(message: string, result: QueryResult, today:
     ].join("\n");
   }
 
+  if (isAttendanceNameFollowUp(message) && (result.missing_checkin || []).length > 0) {
+    return formatMissingCheckinReply(result, today, true);
+  }
+
   if (result.message) return result.message;
   if (typeof result.count === "number") return `Đã tìm thấy **${result.count}** kết quả.`;
 
@@ -1766,6 +1962,16 @@ function inferFallbackIntent(message: string, role: string, today: string): { qu
 
   if (normalized.includes("ca toi")) {
     return { queryArgs: { query_type: "shifts", date: today } };
+  }
+
+  if (isMissingCheckinIntent(message)) {
+    return {
+      queryArgs: {
+        query_type: "attendance",
+        date: today,
+        employee_name: inferEmployeeNameFromMessage(message),
+      },
+    };
   }
 
   if (normalized.includes("cham cong") || normalized.includes("chấm công") || normalized.includes("di muon") || normalized.includes("đi muộn")) {
@@ -2043,6 +2249,30 @@ async function handleFallback(
     }
   }
 
+  const previousUser = previousUserMessage(messages.slice(0, -1));
+  const previousAssistant = previousAssistantMessage(messages.slice(0, -1));
+  const asksMissingCheckinNames =
+    isAttendanceNameFollowUp(message) &&
+    (isMissingCheckinIntent(previousUser) || isMissingCheckinIntent(previousAssistant));
+
+  if (asksMissingCheckinNames) {
+    const attendanceResult = await executeQuery(
+      { query_type: "attendance", date: today },
+      supabaseAdmin,
+      callerBranchId,
+      role,
+    );
+
+    if (attendanceResult.error) {
+      return { reply: attendanceResult.error, mutations: false };
+    }
+
+    return {
+      reply: formatMissingCheckinReply(attendanceResult, today, true),
+      mutations: false,
+    };
+  }
+
   const inferred = inferFallbackIntent(message, role, today);
   if (inferred.reply) {
     return { reply: inferred.reply, mutations: false };
@@ -2134,7 +2364,7 @@ serve(async (req) => {
       return buildLoggedResponse({ ...deterministic, role: userRole, mode: "deterministic" }, 200, auditBase, supabaseAdmin);
     }
 
-    const openAiApiKey = Deno.env.get("OPENAI_API_KEY");
+    const openAiApiKey = (await getSystemApiKey(supabaseAdmin, "openai")) || Deno.env.get("OPENAI_API_KEY");
     if (!openAiApiKey) {
       const fallback = await handleFallback(currentMessage, safeMessages, userRole, supabaseAdmin, callerBranchId, actorName, user.id, today);
       return buildLoggedResponse({ ...fallback, role: userRole, mode: "fallback" }, 200, auditBase, supabaseAdmin);
@@ -2199,6 +2429,15 @@ serve(async (req) => {
         mode: "openai",
       }, 200, auditBase, supabaseAdmin);
     } catch (error) {
+      if (isOpenAIQuotaError(error)) {
+        await notifyItUsersOpenAICreditExhausted(supabaseAdmin, actorName, userRole);
+        return buildLoggedResponse({
+          error: "OpenAI đã hết credit. Vui lòng gửi yêu cầu cấp token. Hệ thống đã thông báo tới IT.",
+          role: userRole,
+          mode: "openai_quota_exhausted",
+        }, 402, auditBase, supabaseAdmin);
+      }
+
       console.error("OpenAI flow failed, switching to fallback:", error);
       const fallback = await handleFallback(currentMessage, safeMessages, userRole, supabaseAdmin, callerBranchId, actorName, user.id, today);
       return buildLoggedResponse({
