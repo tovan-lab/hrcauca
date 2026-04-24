@@ -44,7 +44,7 @@ function appendAssistantMessage(
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>,
   content: string,
 ) {
-  setMessages(prev => [...prev, { role: 'assistant', content }]);
+  setMessages((prev) => [...prev, { role: 'assistant', content }]);
 }
 
 export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
@@ -88,18 +88,20 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
 
     const isInternalAction = msgText === INTERNAL_CONFIRM_MESSAGE || msgText === INTERNAL_CANCEL_MESSAGE;
     const userMsg: Message = { role: 'user', content: msgText };
-    const newMessages = isInternalAction ? [...messages] : [...messages, userMsg];
+    const requestMessages = isInternalAction ? messages : [...messages, userMsg];
     const controller = new AbortController();
     const timeoutId = window.setTimeout(() => controller.abort(), CHAT_REQUEST_TIMEOUT_MS);
 
     if (!isInternalAction) {
-      setMessages(newMessages);
+      setMessages(requestMessages);
       setInput('');
     }
     setLoading(true);
 
     try {
-      const { data: { session: activeSession } } = await supabase.auth.getSession();
+      const {
+        data: { session: activeSession },
+      } = await supabase.auth.getSession();
       const accessToken = activeSession?.access_token || session?.access_token;
 
       if (!accessToken) {
@@ -111,7 +113,7 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
       const invokePromise = supabase.functions.invoke('ai-shift-assistant', {
         body: {
           conversation_id: conversationId,
-          messages: [...newMessages, userMsg].map(m => ({ role: m.role, content: m.content })),
+          messages: [...requestMessages, userMsg].map((message) => ({ role: message.role, content: message.content })),
         },
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -125,7 +127,6 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
       });
 
       const { data, error } = await Promise.race([invokePromise, timeoutPromise]);
-
       const status = (error as { context?: { status?: number } } | null)?.context?.status;
       const errorMessage = typeof error?.message === 'string' ? error.message : '';
 
@@ -145,8 +146,11 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
         return;
       }
       if (status === 402) {
-        appendAssistantMessage(setMessages, 'Dịch vụ AI hiện không khả dụng do hết hạn mức cấu hình ở backend.');
-        toast.error('Hết hạn mức AI.');
+        appendAssistantMessage(
+          setMessages,
+          'OpenAI hiện đã hết credit. Vui lòng gửi yêu cầu cấp token. Hệ thống đã thông báo tới IT để nạp thêm, sau đó bạn có thể chat tiếp.',
+        );
+        toast.error('OpenAI đã hết credit.');
         return;
       }
 
@@ -157,7 +161,7 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
       const reply = typeof data?.reply === 'string' ? data.reply : '';
       const needsConfirm = canManageShifts && reply.toLowerCase().includes('xác nhận');
 
-      setMessages(prev => [
+      setMessages((prev) => [
         ...prev,
         {
           role: 'assistant',
@@ -175,7 +179,7 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
           : err.message
         : 'Lỗi kết nối với Trợ lý AI';
 
-      setMessages(prev => [
+      setMessages((prev) => [
         ...prev,
         {
           role: 'assistant',
@@ -190,12 +194,12 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
   };
 
   const handleConfirm = () => {
-    setMessages(prev => prev.map(m => ({ ...m, pending_confirmation: false })));
+    setMessages((prev) => prev.map((message) => ({ ...message, pending_confirmation: false })));
     sendMessage(INTERNAL_CONFIRM_MESSAGE);
   };
 
   const handleCancel = () => {
-    setMessages(prev => prev.map(m => ({ ...m, pending_confirmation: false })));
+    setMessages((prev) => prev.map((message) => ({ ...message, pending_confirmation: false })));
     sendMessage(INTERNAL_CANCEL_MESSAGE);
   };
 
@@ -204,7 +208,7 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
     setConversationId(crypto.randomUUID());
   };
 
-  const hasPendingConfirmation = messages.some(m => m.pending_confirmation);
+  const hasPendingConfirmation = messages.some((message) => message.pending_confirmation);
 
   const chatContent = (
     <div className="flex flex-col h-full">
@@ -248,13 +252,13 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
               <div className="pt-2">
                 <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">Gợi ý nhanh</p>
                 <div className="flex flex-wrap gap-1.5 justify-center">
-                  {quickActions.slice(0, 4).map(q => (
+                  {quickActions.slice(0, 4).map((question) => (
                     <button
-                      key={q}
+                      key={question}
                       className="text-xs bg-muted px-2.5 py-1.5 rounded-full hover:bg-primary/10 hover:text-primary transition-colors text-left"
-                      onClick={() => sendMessage(q)}
+                      onClick={() => sendMessage(question)}
                     >
-                      {q}
+                      {question}
                     </button>
                   ))}
                 </div>
@@ -262,26 +266,26 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
             </div>
           )}
 
-          {messages.map((m, i) => (
-            <div key={i}>
-              <div className={cn('flex', m.role === 'user' ? 'justify-end' : 'justify-start')}>
+          {messages.map((message, index) => (
+            <div key={index}>
+              <div className={cn('flex', message.role === 'user' ? 'justify-end' : 'justify-start')}>
                 <div
                   className={cn(
                     'max-w-[85%] rounded-2xl px-3.5 py-2.5 text-sm',
-                    m.role === 'user'
+                    message.role === 'user'
                       ? 'bg-primary text-primary-foreground rounded-br-md'
                       : 'bg-muted rounded-bl-md',
                   )}
                 >
-                  {m.role === 'assistant' ? (
+                  {message.role === 'assistant' ? (
                     <div className="prose prose-sm dark:prose-invert max-w-none [&>p]:my-1 [&>ul]:my-1 [&>ol]:my-1 [&>table]:text-xs">
-                      <ReactMarkdown>{m.content}</ReactMarkdown>
+                      <ReactMarkdown>{message.content}</ReactMarkdown>
                     </div>
-                  ) : m.content}
+                  ) : message.content}
                 </div>
               </div>
 
-              {m.pending_confirmation && canManageShifts && (
+              {message.pending_confirmation && canManageShifts && (
                 <div className="flex gap-2 mt-2 ml-1">
                   <Button size="sm" onClick={handleConfirm} className="text-xs gap-1 h-8 bg-primary hover:bg-primary/90">
                     Xác nhận thay đổi
@@ -306,12 +310,18 @@ export function ShiftAIChat({ onDataChanged }: ShiftAIChatProps) {
       </ScrollArea>
 
       <div className="p-3 border-t shrink-0">
-        <form className="flex gap-2" onSubmit={e => { e.preventDefault(); sendMessage(); }}>
+        <form
+          className="flex gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            sendMessage();
+          }}
+        >
           <Input
             ref={inputRef}
             placeholder={hasPendingConfirmation ? 'Vui lòng xác nhận hoặc hủy...' : 'Nhập câu hỏi...'}
             value={input}
-            onChange={e => setInput(e.target.value)}
+            onChange={(event) => setInput(event.target.value)}
             disabled={loading || hasPendingConfirmation}
             className="text-sm rounded-full"
           />

@@ -15,6 +15,7 @@ import { template as shiftSupportApproved } from './shift-support-approved.tsx'
 import { template as branchChanged } from './branch-changed.tsx'
 import { template as earlyCheckoutApprovalRequest } from './early-checkout-approval-request.tsx'
 import { template as forgotCheckoutSummary } from './forgot-checkout-summary.tsx'
+import { template as aiCreditExhaustedAlert } from './ai-credit-exhausted-alert.tsx'
 
 export const TEMPLATES: Record<string, TemplateEntry> = {
   'shift-assigned': shiftAssigned,
@@ -23,4 +24,5 @@ export const TEMPLATES: Record<string, TemplateEntry> = {
   'branch-changed': branchChanged,
   'early-checkout-approval-request': earlyCheckoutApprovalRequest,
   'forgot-checkout-summary': forgotCheckoutSummary,
+  'ai-credit-exhausted-alert': aiCreditExhaustedAlert,
 }

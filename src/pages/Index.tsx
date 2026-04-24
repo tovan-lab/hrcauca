@@ -16,5 +16,6 @@ export default function Index() {
   if (!isAuthenticated || !user) return <Navigate to="/login" replace />;
   if (user.status !== 'active') return <Navigate to="/pending" replace />;
   if (user.role === 'EMPLOYEE') return <Navigate to="/check-in" replace />;
+  if (user.role === 'IT') return <Navigate to="/storage" replace />;
   return <Navigate to="/dashboard" replace />;
 }

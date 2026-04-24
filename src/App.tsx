@@ -25,6 +25,8 @@ import MyPerformancePage from './pages/MyPerformancePage';
 import ShiftLogsPage from './pages/ShiftLogsPage';
 import EmployeeReportPage from './pages/EmployeeReportPage';
 import StorageManagementPage from './pages/StorageManagementPage';
+import SystemSettingsPage from './pages/SystemSettingsPage';
+import ChatAuditPage from './pages/ChatAuditPage';
 import HRHubPage from './pages/HRHubPage';
 import EarlyCheckoutRequestsPage from './pages/EarlyCheckoutRequestsPage';
 import UnsubscribePage from './pages/UnsubscribePage';
@@ -56,9 +58,12 @@ const App = () => (
                   <Route path="/logs" element={<ProtectedRoute roles={['ADMIN', 'HR']}><AppLayout><LogsPage /></AppLayout></ProtectedRoute>} />
                   <Route path="/shift-logs" element={<ProtectedRoute roles={['ADMIN', 'HR']}><AppLayout><ShiftLogsPage /></AppLayout></ProtectedRoute>} />
                   <Route path="/employee-report" element={<ProtectedRoute roles={['ADMIN', 'HR']}><AppLayout><EmployeeReportPage /></AppLayout></ProtectedRoute>} />
-                  <Route path="/settings" element={<ProtectedRoute roles={['ADMIN', 'HR', 'EMPLOYEE']}><AppLayout><SettingsPage /></AppLayout></ProtectedRoute>} />
+                  <Route path="/settings" element={<ProtectedRoute roles={['ADMIN', 'HR', 'EMPLOYEE', 'IT']}><AppLayout><SettingsPage /></AppLayout></ProtectedRoute>} />
+                  <Route path="/system-settings" element={<ProtectedRoute roles={['IT']}><AppLayout><SystemSettingsPage /></AppLayout></ProtectedRoute>} />
+                  <Route path="/api-management" element={<ProtectedRoute roles={['IT', 'HR']}><AppLayout><SystemSettingsPage /></AppLayout></ProtectedRoute>} />
+                  <Route path="/chat-audit" element={<ProtectedRoute roles={['IT']}><AppLayout><ChatAuditPage /></AppLayout></ProtectedRoute>} />
                   <Route path="/branches" element={<ProtectedRoute roles={['ADMIN']}><AppLayout><BranchesPage /></AppLayout></ProtectedRoute>} />
-                  <Route path="/storage" element={<ProtectedRoute roles={['ADMIN']}><AppLayout><StorageManagementPage /></AppLayout></ProtectedRoute>} />
+                  <Route path="/storage" element={<ProtectedRoute roles={['IT']}><AppLayout><StorageManagementPage /></AppLayout></ProtectedRoute>} />
                   <Route path="/hr-hub" element={<ProtectedRoute roles={['ADMIN', 'HR']}><AppLayout><HRHubPage /></AppLayout></ProtectedRoute>} />
                   <Route path="/early-checkout-requests" element={<ProtectedRoute roles={['HR']}><AppLayout><EarlyCheckoutRequestsPage /></AppLayout></ProtectedRoute>} />
                   <Route path="/unsubscribe" element={<UnsubscribePage />} />

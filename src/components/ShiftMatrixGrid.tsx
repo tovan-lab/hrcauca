@@ -40,6 +40,14 @@ interface ShiftRow {
   actual_branch_id?: string | null;
 }
 
+interface CheckInRow {
+  id: string;
+  shift_id: string | null;
+  user_id: string;
+  check_in_time: string | null;
+  check_out_time: string | null;
+}
+
 interface ProfileInfo {
   user_id: string;
   name: string;
@@ -55,6 +63,14 @@ interface DraftChange {
   originalValue: CellValue;
 }
 
+interface WeeklyEmployeeColumn {
+  userId: string;
+  date: string;
+  employeeName: string;
+  branchName: string;
+  totalHours: number;
+}
+
 interface TransactionalEmailRequest {
   templateName: string;
   recipientEmail: string;
@@ -64,6 +80,13 @@ interface TransactionalEmailRequest {
 
 interface TransactionalEmailInvokeOptions {
   body: TransactionalEmailRequest;
+}
+
+interface RenderedCellState {
+  rawValue: string;
+  displayText: string;
+  numericValue: number;
+  isOff: boolean;
 }
 
 // Time slots: 15:00 same day → 05:00 next day (overnight ca chiều/tối/đêm)
@@ -137,6 +160,7 @@ export function ShiftMatrixGrid() {
   const userBranchId = (user as any)?.branch_id;
 
   const [shifts, setShifts] = useState<ShiftRow[]>([]);
+  const [checkIns, setCheckIns] = useState<CheckInRow[]>([]);
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [branches, setBranches] = useState<{ id: string; branch_name: string }[]>([]);
   const [assignments, setAssignments] = useState<AssignmentLite[]>([]);
@@ -210,8 +234,9 @@ export function ShiftMatrixGrid() {
     const from = format(weekStart, 'yyyy-MM-dd');
     const to = format(weekEnd, 'yyyy-MM-dd');
     const currentMonth = getCurrentMonth();
+    const checkInTo = format(addDays(weekEnd, 1), 'yyyy-MM-dd');
 
-    const [{ data: shiftData }, { data: profs }, { data: branchList }, { data: logs }, { data: assigns }] = await Promise.all([
+    const [{ data: shiftData }, { data: profs }, { data: branchList }, { data: logs }, { data: assigns }, { data: checkInData }] = await Promise.all([
       supabase.from('shifts').select('id, user_id, shift_date, shift_type, start_time, end_time, actual_branch_id').gte('shift_date', from).lte('shift_date', to).order('shift_date'),
       supabase.from('profiles').select('user_id, name, email, branch_id').eq('status', 'active'),
       supabase.from('branches').select('id, branch_name'),
@@ -222,6 +247,11 @@ export function ShiftMatrixGrid() {
         .eq('status', 'active')
         .lte('start_date', to)
         .gte('end_date', from),
+      supabase
+        .from('check_ins')
+        .select('id, shift_id, user_id, check_in_time, check_out_time')
+        .gte('check_in_time', `${from}T00:00:00`)
+        .lte('check_in_time', `${checkInTo}T23:59:59`),
     ]);
 
     if (branchList) setBranches(branchList as any);
@@ -245,6 +275,12 @@ export function ShiftMatrixGrid() {
       allShifts = allShifts.filter(s => branchUserIds.has(s.user_id));
     }
     setShifts(allShifts);
+    let allCheckIns = (checkInData as CheckInRow[]) || [];
+    if (isHR && userBranchId) {
+      const branchUserIds = new Set(allProfiles.map(p => p.user_id));
+      allCheckIns = allCheckIns.filter(c => branchUserIds.has(c.user_id));
+    }
+    setCheckIns(allCheckIns);
 
     // Edit log counts
     const logMap: Record<string, number> = {};
@@ -316,18 +352,173 @@ export function ShiftMatrixGrid() {
     return result;
   }, []);
 
-  // Calculate total hours for an employee in the displayed week
-  const getEmployeeTotalHours = useCallback((userId: string) => {
-    const cells = displayMatrix[userId];
-    if (!cells) return 0;
-    let total = 0;
-    for (const key of Object.keys(cells)) {
-      const v = cells[key];
-      if (v === '1') total += 1;
-      else if (v === '1.25') total += 1.25;
+  const shiftsByUserDate = useMemo(() => {
+    const grouped = new Map<string, ShiftRow[]>();
+    for (const shift of shifts) {
+      const key = `${shift.user_id}_${shift.shift_date}`;
+      const current = grouped.get(key) || [];
+      current.push(shift);
+      grouped.set(key, current);
     }
-    return total;
-  }, [displayMatrix]);
+    return grouped;
+  }, [shifts]);
+
+  const checkInByShiftId = useMemo(() => {
+    const grouped = new Map<string, CheckInRow>();
+    for (const checkIn of checkIns) {
+      if (checkIn.shift_id) grouped.set(checkIn.shift_id, checkIn);
+    }
+    return grouped;
+  }, [checkIns]);
+
+  const roundToQuarter = useCallback((value: number) => {
+    return Math.round(value * 4) / 4;
+  }, []);
+
+  const formatDisplayHours = useCallback((value: number) => {
+    if (value <= 0) return '';
+    const rounded = roundToQuarter(value);
+    if (Number.isInteger(rounded)) return String(rounded);
+    return rounded.toFixed(2).replace('.', ',').replace(/0$/, '');
+  }, [roundToQuarter]);
+
+  const parseMatrixValue = useCallback((value: string): number => {
+    if (value === '1') return 1;
+    if (value === '1.25') return 1.25;
+    return 0;
+  }, []);
+
+  const getSlotWindow = useCallback((date: string, slot: string) => {
+    const [startLabel] = slot.split('-');
+    const [startHour, startMinute] = startLabel.split(':').map(Number);
+    const slotStart = new Date(`${date}T00:00:00`);
+    if (startHour < 15) slotStart.setDate(slotStart.getDate() + 1);
+    slotStart.setHours(startHour, startMinute, 0, 0);
+
+    const slotEnd = new Date(slotStart);
+    slotEnd.setHours(slotEnd.getHours() + 1);
+
+    return { slotStart, slotEnd };
+  }, []);
+
+  const getShiftWindow = useCallback((shift: ShiftRow) => {
+    const shiftStart = new Date(`${shift.shift_date}T${shift.start_time.slice(0, 5)}:00`);
+    const shiftEnd = new Date(`${shift.shift_date}T${shift.end_time.slice(0, 5)}:00`);
+    if (shiftEnd <= shiftStart) {
+      shiftEnd.setDate(shiftEnd.getDate() + 1);
+    }
+    return { shiftStart, shiftEnd };
+  }, []);
+
+  const getActualSlotValue = useCallback((shift: ShiftRow, checkIn: CheckInRow, slot: string) => {
+    const { shiftStart, shiftEnd } = getShiftWindow(shift);
+    const actualStart = checkIn.check_in_time ? new Date(checkIn.check_in_time) : shiftStart;
+    const actualEnd = checkIn.check_out_time ? new Date(checkIn.check_out_time) : shiftEnd;
+
+    const workStart = new Date(Math.max(shiftStart.getTime(), actualStart.getTime()));
+    const workEnd = new Date(Math.min(shiftEnd.getTime(), actualEnd.getTime()));
+
+    if (workEnd <= workStart) return 0;
+
+    const { slotStart, slotEnd } = getSlotWindow(shift.shift_date, slot);
+    const overlapStart = Math.max(workStart.getTime(), slotStart.getTime());
+    const overlapEnd = Math.min(workEnd.getTime(), slotEnd.getTime());
+
+    if (overlapEnd <= overlapStart) return 0;
+
+    const overlapHours = (overlapEnd - overlapStart) / (1000 * 60 * 60);
+    const slotHour = slotStart.getHours();
+    const multiplier = slotHour >= 0 && slotHour < 6 ? 1.25 : 1;
+
+    return roundToQuarter(overlapHours * multiplier);
+  }, [getShiftWindow, getSlotWindow, roundToQuarter]);
+
+  const getRenderedCellState = useCallback((userId: string, date: string, slot: string): RenderedCellState => {
+    const draftKey = `${userId}_${date}_${slot}`;
+    const draftValue = drafts.get(draftKey)?.value;
+    if (draftValue !== undefined) {
+      return {
+        rawValue: draftValue,
+        displayText: draftValue === 'off' ? '✕' : formatDisplayHours(parseMatrixValue(draftValue)),
+        numericValue: parseMatrixValue(draftValue),
+        isOff: draftValue === 'off',
+      };
+    }
+
+    const relevantShifts = shiftsByUserDate.get(`${userId}_${date}`) || [];
+    let actualValue = 0;
+    let hasActualCheckIn = false;
+
+    for (const shift of relevantShifts) {
+      const checkIn = checkInByShiftId.get(shift.id);
+      if (!checkIn) continue;
+      hasActualCheckIn = true;
+      actualValue += getActualSlotValue(shift, checkIn, slot);
+    }
+
+    if (hasActualCheckIn) {
+      const roundedActual = roundToQuarter(actualValue);
+      return {
+        rawValue: roundedActual > 0 ? String(roundedActual) : '',
+        displayText: formatDisplayHours(roundedActual),
+        numericValue: roundedActual,
+        isOff: false,
+      };
+    }
+
+    const baseValue = displayMatrix[userId]?.[`${date}_${slot}`] || '';
+    return {
+      rawValue: baseValue,
+      displayText: baseValue === 'off' ? '✕' : formatDisplayHours(parseMatrixValue(baseValue)),
+      numericValue: parseMatrixValue(baseValue),
+      isOff: baseValue === 'off',
+    };
+  }, [checkInByShiftId, displayMatrix, drafts, formatDisplayHours, getActualSlotValue, parseMatrixValue, roundToQuarter, shiftsByUserDate]);
+
+  const getEmployeeTotalHours = useCallback((userId: string) => {
+    let total = 0;
+    for (const date of dates) {
+      const dateStr = format(date, 'yyyy-MM-dd');
+      for (const slot of TIME_SLOTS) {
+        total += getRenderedCellState(userId, dateStr, slot).numericValue;
+      }
+    }
+    return roundToQuarter(total);
+  }, [dates, getRenderedCellState, roundToQuarter]);
+
+  const getEmployeeDayTotalHours = useCallback((userId: string, date: string) => {
+    let total = 0;
+    for (const slot of TIME_SLOTS) {
+      total += getRenderedCellState(userId, date, slot).numericValue;
+    }
+    return roundToQuarter(total);
+  }, [getRenderedCellState, roundToQuarter]);
+
+  const weeklyGroupedColumns = useMemo(() => {
+    if (!(isHR && rangeMode === 'week')) return [];
+
+    return dates
+      .map((date) => {
+        const dateStr = format(date, 'yyyy-MM-dd');
+        const employees: WeeklyEmployeeColumn[] = filteredProfiles
+          .map((profile) => ({
+            userId: profile.user_id,
+            date: dateStr,
+            employeeName: profile.name,
+            branchName: getBranchName(profile.branch_id),
+            totalHours: getEmployeeDayTotalHours(profile.user_id, dateStr),
+          }))
+          .filter((item) => item.totalHours > 0);
+
+        return { date, dateStr, employees };
+      })
+      .filter((group) => group.employees.length > 0);
+  }, [dates, filteredProfiles, getBranchName, getEmployeeDayTotalHours, isHR, rangeMode]);
+
+  const weeklyEmployeeColumns = useMemo(
+    () => weeklyGroupedColumns.flatMap((group) => group.employees),
+    [weeklyGroupedColumns],
+  );
 
   const handleCellClick = (userId: string, date: string, slotKey: string) => {
     const cellKey = `${userId}_${date}_${slotKey}`;
@@ -705,11 +896,14 @@ export function ShiftMatrixGrid() {
     toast.info('Đã hủy tất cả thay đổi');
   };
 
-  const cellBg = (value: CellValue, isDraft: boolean) => {
+  const cellBg = (value: string, isDraft: boolean) => {
     if (isDraft) return 'bg-yellow-100 dark:bg-yellow-900/40 border-yellow-400';
     if (value === '1') return 'bg-primary/15 text-primary';
     if (value === '1.25') return 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400';
     if (value === 'off') return 'bg-destructive/10 text-destructive';
+    if (value && Number(value) > 0) {
+      return Number(value) > 1 ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400' : 'bg-primary/15 text-primary';
+    }
     return 'bg-background';
   };
 
@@ -812,7 +1006,89 @@ export function ShiftMatrixGrid() {
       </div>
 
       {/* Matrix Table */}
-      <div className="border rounded-lg overflow-auto max-h-[70vh]" style={{ maxWidth: '100%' }}>
+      {isHR && rangeMode === 'week' ? (
+        <div className="border rounded-lg overflow-auto max-h-[70vh] max-w-full overscroll-x-contain">
+          <table className="text-xs border-collapse min-w-max">
+            <thead className="sticky top-0 z-30 bg-card">
+              <tr className="border-b">
+                <th className="sticky top-0 left-0 z-50 bg-card border-r px-2 py-1.5 text-left font-medium text-muted-foreground min-w-[100px]">
+                  Khung giờ
+                </th>
+                {weeklyGroupedColumns.map((group) => (
+                  <th key={group.dateStr} colSpan={group.employees.length} className="sticky top-0 z-40 bg-card border-r px-2 py-1.5 text-center font-semibold min-w-[112px]">
+                    {format(group.date, 'EEEE', { locale: vi })}
+                    <div className="text-[10px] font-normal text-muted-foreground">
+                      {format(group.date, 'dd/MM/yyyy')}
+                    </div>
+                  </th>
+                ))}
+              </tr>
+              <tr className="border-b">
+                <th className="sticky top-[37px] left-0 z-50 bg-card border-r px-2 py-1 text-left text-muted-foreground font-normal">
+                  Nhân viên
+                </th>
+                {weeklyEmployeeColumns.map((column) => (
+                  <th key={`${column.date}_${column.userId}_name`} className="sticky top-[37px] z-40 bg-card border-r px-2 py-1 text-center font-medium min-w-[112px]">
+                    {column.employeeName}
+                  </th>
+                ))}
+              </tr>
+              <tr className="border-b">
+                <th className="sticky top-[69px] left-0 z-50 bg-card border-r px-2 py-1 text-left text-muted-foreground font-normal">
+                  Chi nhánh
+                </th>
+                {weeklyEmployeeColumns.map((column) => (
+                  <th key={`${column.date}_${column.userId}_branch`} className="sticky top-[69px] z-40 bg-card border-r px-2 py-1 text-center font-normal text-muted-foreground min-w-[112px]">
+                    {column.branchName}
+                  </th>
+                ))}
+              </tr>
+              <tr className="border-b bg-muted/30">
+                <th className="sticky top-[101px] left-0 z-50 bg-muted/30 border-r px-2 py-1 text-left text-muted-foreground font-normal">
+                  Tổng giờ
+                </th>
+                {weeklyEmployeeColumns.map((column) => (
+                  <th key={`${column.date}_${column.userId}_hours`} className="sticky top-[101px] z-40 bg-muted/30 border-r px-2 py-1 text-center font-bold text-primary min-w-[112px]">
+                    {formatDisplayHours(column.totalHours)}h
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {TIME_SLOTS.map((slot) => (
+                <tr key={slot} className="border-b hover:bg-muted/20">
+                  <td className="sticky left-0 z-20 bg-card border-r px-2 py-1 font-mono text-[10px] text-muted-foreground whitespace-nowrap">
+                    {slot}
+                  </td>
+                  {weeklyEmployeeColumns.map((column) => {
+                    const draftKey = `${column.userId}_${column.date}_${slot}`;
+                    const renderedCell = getRenderedCellState(column.userId, column.date, slot);
+                    const isDraft = drafts.has(draftKey);
+
+                    return (
+                      <td
+                        key={`${column.date}_${column.userId}_${slot}`}
+                        className={cn(
+                          'border-r px-0.5 py-0.5 text-center cursor-pointer select-none transition-colors min-w-[112px]',
+                          cellBg(renderedCell.isOff ? 'off' : renderedCell.rawValue, isDraft),
+                          'hover:ring-1 hover:ring-primary/50'
+                        )}
+                        onClick={() => handleCellClick(column.userId, column.date, slot)}
+                        title={`${column.employeeName} - ${format(new Date(column.date), 'dd/MM')} ${slot}`}
+                      >
+                        <span className="text-[10px] font-mono">
+                          {renderedCell.displayText}
+                        </span>
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="border rounded-lg overflow-auto max-h-[70vh]" style={{ maxWidth: '100%' }}>
         <table className="text-xs border-collapse min-w-max">
           <thead className="sticky top-0 z-20 bg-card">
             {/* Row 1: Employee names */}
@@ -880,7 +1156,7 @@ export function ShiftMatrixGrid() {
               </th>
               {filteredProfiles.map(p => (
                 <th key={p.user_id} colSpan={dates.length} className="px-2 py-1 text-center font-bold text-primary border-r">
-                  {getEmployeeTotalHours(p.user_id)}h
+                  {formatDisplayHours(getEmployeeTotalHours(p.user_id))}h
                 </th>
               ))}
             </tr>
@@ -909,24 +1185,23 @@ export function ShiftMatrixGrid() {
                 {filteredProfiles.map(p =>
                   dates.map(d => {
                     const dateStr = format(d, 'yyyy-MM-dd');
-                    const cellKey = `${dateStr}_${slot}`;
                     const draftKey = `${p.user_id}_${dateStr}_${slot}`;
-                    const value = displayMatrix[p.user_id]?.[cellKey] || '';
+                    const renderedCell = getRenderedCellState(p.user_id, dateStr, slot);
                     const isDraft = drafts.has(draftKey);
 
                     return (
                       <td
-                        key={`${p.user_id}_${cellKey}`}
+                        key={`${p.user_id}_${dateStr}_${slot}`}
                         className={cn(
                           'border-r px-0.5 py-0.5 text-center cursor-pointer select-none transition-colors min-w-[32px]',
-                          cellBg(value, isDraft),
+                          cellBg(renderedCell.isOff ? 'off' : renderedCell.rawValue, isDraft),
                           'hover:ring-1 hover:ring-primary/50'
                         )}
                         onClick={() => handleCellClick(p.user_id, dateStr, slot)}
                         title={`${p.name} - ${format(d, 'dd/MM')} ${slot}`}
                       >
                         <span className="text-[10px] font-mono">
-                          {value === '1' ? '1' : value === '1.25' ? '1.25' : value === 'off' ? '✕' : ''}
+                          {renderedCell.displayText}
                         </span>
                       </td>
                     );
@@ -937,6 +1212,7 @@ export function ShiftMatrixGrid() {
           </tbody>
         </table>
       </div>
+      )}
 
       {/* Penalty warning dialog */}
       <AlertDialog open={!!penaltyWarning} onOpenChange={open => !open && setPenaltyWarning(null)}>
@@ -1108,3 +1384,5 @@ export function ShiftMatrixGrid() {
     </div>
   );
 }
+
+

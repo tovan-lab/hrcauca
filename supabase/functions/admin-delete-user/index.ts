@@ -117,6 +117,15 @@ Deno.serve(async (req) => {
       return json({ error: "Thiếu email hoặc user_id" }, 400);
     }
 
+    const { data: targetRoles } = await admin
+      .from("user_roles")
+      .select("role")
+      .eq("user_id", targetUserId);
+    const targetRoleSet = new Set((targetRoles ?? []).map((r: { role: string }) => r.role));
+    if (targetRoleSet.has("IT")) {
+      return json({ error: "Không được xóa tài khoản IT." }, 403);
+    }
+
     if (!roleSet.has("ADMIN") && roleSet.has("HR")) {
       const { data: callerProfile } = await admin
         .from("profiles")

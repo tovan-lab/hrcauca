@@ -13,7 +13,7 @@ type CreateUserPayload = {
   email?: string;
   password?: string;
   name?: string;
-  role?: "EMPLOYEE" | "HR" | "ADMIN";
+  role?: "EMPLOYEE" | "HR" | "ADMIN" | "IT";
   branch_id?: string | null;
 };
 
@@ -89,7 +89,7 @@ Deno.serve(async (req) => {
     const email = String(body.email ?? "").trim().toLowerCase();
     const password = String(body.password ?? "");
     const name = String(body.name ?? "").trim();
-    const targetRole = (body.role ?? "EMPLOYEE") as "EMPLOYEE" | "HR" | "ADMIN";
+    const targetRole = (body.role ?? "EMPLOYEE") as "EMPLOYEE" | "HR" | "ADMIN" | "IT";
     const targetBranchId = body.branch_id ?? null;
 
     if (!email || !password || !name) {
@@ -120,8 +120,8 @@ Deno.serve(async (req) => {
         .maybeSingle();
       callerBranchId = callerProfile?.branch_id ?? null;
 
-      if (targetRole === "ADMIN") {
-        return json({ error: "HR không được tạo tài khoản ADMIN" }, 403);
+      if (targetRole === "ADMIN" || targetRole === "IT") {
+        return json({ error: "HR không được tạo tài khoản ADMIN hoặc IT" }, 403);
       }
       if (targetBranchId !== null && targetBranchId !== callerBranchId) {
         return json({ error: "HR chỉ được tạo nhân viên trong chi nhánh của mình" }, 403);
@@ -158,6 +158,17 @@ Deno.serve(async (req) => {
       userId = data.user.id;
       mode = "created_new";
     } else {
+      const { data: existingRoles } = await admin
+        .from("user_roles")
+        .select("role")
+        .eq("user_id", existingUserId);
+      const existingRoleSet = new Set((existingRoles ?? []).map((item: { role: string }) => item.role));
+      if (existingRoleSet.has("IT")) {
+        return json({ error: "Không được cập nhật hay thay đổi tài khoản IT hiện có." }, 403);
+      }
+      if (targetRole === "IT") {
+        return json({ error: "Hãy tạo mới tài khoản IT thay vì chuyển quyền từ user hiện có." }, 400);
+      }
       const { error } = await admin.auth.admin.updateUserById(existingUserId, {
         password,
         email_confirm: true,

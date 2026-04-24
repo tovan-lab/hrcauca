@@ -29,7 +29,7 @@ export default function LoginPage() {
   }
 
   if (isAuthenticated && user) {
-    return <Navigate to={user.role === 'EMPLOYEE' ? '/check-in' : '/dashboard'} replace />;
+    return <Navigate to={user.role === 'EMPLOYEE' ? '/check-in' : user.role === 'IT' ? '/storage' : '/dashboard'} replace />;
   }
 
   const formatTime = (seconds: number) => {

@@ -1,4 +1,4 @@
-export type UserRole = 'ADMIN' | 'HR' | 'EMPLOYEE';
+export type UserRole = 'ADMIN' | 'HR' | 'EMPLOYEE' | 'IT';
 export type UserStatus = 'pending' | 'active' | 'inactive';
 
 export interface Branch {

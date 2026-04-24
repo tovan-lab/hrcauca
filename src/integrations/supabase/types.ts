@@ -785,11 +785,31 @@ export type Database = {
           total_files: number
         }[]
       }
+      get_storage_usage_by_bucket: {
+        Args: never
+        Returns: {
+          bucket_id: string
+          total_bytes: number
+          total_files: number
+        }[]
+      }
+      get_total_storage_usage: {
+        Args: never
+        Returns: {
+          bucket_count: number
+          total_bytes: number
+          total_files: number
+        }[]
+      }
       has_role: {
         Args: {
           _role: Database["public"]["Enums"]["app_role"]
           _user_id: string
         }
+        Returns: boolean
+      }
+      is_it_user: {
+        Args: { _user_id: string }
         Returns: boolean
       }
       move_to_dlq: {
@@ -811,7 +831,7 @@ export type Database = {
       }
     }
     Enums: {
-      app_role: "ADMIN" | "HR" | "EMPLOYEE"
+      app_role: "ADMIN" | "HR" | "EMPLOYEE" | "IT"
       attendance_status:
         | "on_time"
         | "late"
@@ -946,7 +966,7 @@ export type CompositeTypes<
 export const Constants = {
   public: {
     Enums: {
-      app_role: ["ADMIN", "HR", "EMPLOYEE"],
+      app_role: ["ADMIN", "HR", "EMPLOYEE", "IT"],
       attendance_status: [
         "on_time",
         "late",

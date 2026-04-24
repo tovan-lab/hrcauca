@@ -21,3 +21,11 @@ project_id = "qlvxhnljtxlscwwshofn"
     verify_jwt = false
   [functions.admin-create-user]
     verify_jwt = false
+[functions.it-storage-manager]
+verify_jwt = false
+
+[functions.system-config-manager]
+verify_jwt = false
+
+[functions.it-chat-audit-manager]
+verify_jwt = false

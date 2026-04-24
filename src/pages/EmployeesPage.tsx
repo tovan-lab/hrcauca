@@ -58,6 +58,7 @@ export default function EmployeesPage() {
 
   const isHR = user?.role === 'HR';
   const userBranchId = (user as any)?.branch_id;
+  const isITUser = (employee: Pick<EmployeeRow, 'role'>) => employee.role === 'IT';
 
   const invokeTransactionalEmail = useCallback(async (body: TransactionalEmailRequest) => {
     const result = await supabase.functions.invoke('send-transactional-email', { body });
@@ -136,6 +137,11 @@ export default function EmployeesPage() {
   };
 
   const handleDeactivate = async (userId: string) => {
+    const employee = employees.find((item) => item.user_id === userId);
+    if (employee && isITUser(employee)) {
+      toast.error('Không thể vô hiệu hóa tài khoản IT');
+      return;
+    }
     const { error } = await supabase.from('profiles')
       .update({ status: 'inactive', is_active: false } as any)
       .eq('user_id', userId);
@@ -148,6 +154,11 @@ export default function EmployeesPage() {
   };
 
   const handleActivate = async (userId: string) => {
+    const employee = employees.find((item) => item.user_id === userId);
+    if (employee && isITUser(employee)) {
+      toast.error('Không thể chỉnh sửa trạng thái tài khoản IT');
+      return;
+    }
     const { error } = await supabase.from('profiles')
       .update({ status: 'active', is_active: true } as any)
       .eq('user_id', userId);
@@ -208,7 +219,7 @@ export default function EmployeesPage() {
         password: newPassword,
         name: newName,
         role: newRole,
-        branch_id: newBranch && newBranch !== 'none' ? newBranch : null,
+        branch_id: newRole === 'IT' ? null : newBranch && newBranch !== 'none' ? newBranch : null,
       },
     });
 
@@ -324,6 +335,10 @@ export default function EmployeesPage() {
   const handleChangeBranch = async (userId: string, branchId: string) => {
     const newBranchId = branchId === 'none' ? null : branchId;
     const emp = employees.find((e) => e.user_id === userId);
+    if (emp && isITUser(emp)) {
+      toast.error('Không thể đổi chi nhánh cho tài khoản IT');
+      return;
+    }
     const oldBranchId = emp?.branch_id ?? null;
 
     // Skip if no actual change
@@ -367,6 +382,11 @@ export default function EmployeesPage() {
   };
 
   const handleChangeRole = async (userId: string, role: string) => {
+    const emp = employees.find((item) => item.user_id === userId);
+    if (role === 'IT' || (emp && isITUser(emp))) {
+      toast.error('Không thể chỉnh sửa quyền IT');
+      return;
+    }
     const { error } = await supabase.from('user_roles')
       .update({ role: role as any })
       .eq('user_id', userId);
@@ -379,6 +399,11 @@ export default function EmployeesPage() {
   };
 
   const handleDeleteEmployee = async (userId: string, empName: string) => {
+    const emp = employees.find((item) => item.user_id === userId);
+    if (emp && isITUser(emp)) {
+      toast.error('Không thể xóa tài khoản IT');
+      return;
+    }
     // Gọi edge function: xóa cả auth.users + dữ liệu liên quan + profile
     const { data, error } = await supabase.functions.invoke('admin-delete-user', {
       body: { user_id: userId },
@@ -416,6 +441,8 @@ export default function EmployeesPage() {
   const roleBadgeVariant = (r: string) => {
     switch (r) { case 'ADMIN': return 'destructive' as const; case 'HR': return 'default' as const; default: return 'secondary' as const; }
   };
+  const displayRoleLabel = (r: string) => (r === 'IT' ? 'IT' : roleLabel(r));
+  const displayRoleBadgeVariant = (r: string) => (r === 'IT' ? 'outline' as const : roleBadgeVariant(r));
   const statusBadge = (s: string) => {
     switch (s) {
       case 'active': return <Badge variant="default" className="text-xs">Hoạt động</Badge>;
@@ -463,6 +490,7 @@ export default function EmployeesPage() {
                     <SelectItem value="EMPLOYEE">Nhân viên</SelectItem>
                     <SelectItem value="HR">Quản lý</SelectItem>
                     {isAdmin && <SelectItem value="ADMIN">HR</SelectItem>}
+                    {isAdmin && <SelectItem value="IT">IT</SelectItem>}
                   </SelectContent>
                 </Select>
               </div>
@@ -533,7 +561,7 @@ export default function EmployeesPage() {
                           <TableCell className="font-medium text-sm">{emp.name}</TableCell>
                           <TableCell className="text-sm text-muted-foreground">{emp.email}</TableCell>
                           <TableCell>
-                            {isAdmin ? (
+                            {isAdmin && !isITUser(emp) ? (
                               <Select value={emp.role} onValueChange={v => handleChangeRole(emp.user_id, v)}>
                                 <SelectTrigger className="w-28 h-7 text-xs">
                                   <SelectValue />
@@ -545,7 +573,7 @@ export default function EmployeesPage() {
                                 </SelectContent>
                               </Select>
                             ) : (
-                              <Badge variant={roleBadgeVariant(emp.role)} className="text-xs">{roleLabel(emp.role)}</Badge>
+                              <Badge variant={displayRoleBadgeVariant(emp.role)} className="text-xs">{displayRoleLabel(emp.role)}</Badge>
                             )}
                           </TableCell>
                           {canApprove && (
@@ -588,6 +616,7 @@ export default function EmployeesPage() {
                 <SelectItem value="EMPLOYEE">Nhân viên</SelectItem>
                 <SelectItem value="HR">Quản lý</SelectItem>
                 <SelectItem value="ADMIN">HR</SelectItem>
+                <SelectItem value="IT">IT</SelectItem>
               </SelectContent>
             </Select>
             <Select value={branchFilter} onValueChange={setBranchFilter}>
@@ -640,7 +669,7 @@ export default function EmployeesPage() {
                           <TableCell className="font-medium text-sm">{emp.name}</TableCell>
                           <TableCell className="text-sm text-muted-foreground">{emp.email}</TableCell>
                           <TableCell>
-                            {canManage ? (
+                            {canManage && !isITUser(emp) ? (
                               <div className="w-36">
                                 <Select value={emp.branch_id ?? 'none'} onValueChange={v => handleChangeBranch(emp.user_id, v)}>
                                   <SelectTrigger className="h-7 text-xs">
@@ -659,13 +688,13 @@ export default function EmployeesPage() {
                             )}
                           </TableCell>
                           <TableCell>
-                            <Badge variant={roleBadgeVariant(emp.role)} className="text-xs">{roleLabel(emp.role)}</Badge>
+                            <Badge variant={displayRoleBadgeVariant(emp.role)} className="text-xs">{displayRoleLabel(emp.role)}</Badge>
                           </TableCell>
                           <TableCell>{statusBadge(emp.status)}</TableCell>
                           {canManage && (
                             <TableCell className="text-right">
                               <div className="flex gap-1 justify-end items-center">
-                                {isAdmin && (
+                                {isAdmin && !isITUser(emp) && (
                                   <Select value={emp.role} onValueChange={v => handleChangeRole(emp.user_id, v)}>
                                     <SelectTrigger className="w-28 h-7 text-xs">
                                       <Shield className="h-3 w-3 mr-1" />
@@ -678,17 +707,17 @@ export default function EmployeesPage() {
                                     </SelectContent>
                                   </Select>
                                 )}
-                                {emp.status === 'active' ? (
+                                {!isITUser(emp) && emp.status === 'active' ? (
                                   <Button variant="ghost" size="sm" className="h-7 text-xs text-destructive" onClick={() => handleDeactivate(emp.user_id)}>
                                     Vô hiệu
                                   </Button>
-                                ) : (
+                                ) : !isITUser(emp) ? (
                                   <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => handleActivate(emp.user_id)}>
                                     Kích hoạt
                                   </Button>
-                                )}
+                                ) : null}
                                 {/* Delete button - Admin can delete all, HR can delete branch employees */}
-                                {emp.user_id !== user?.id && (
+                                {emp.user_id !== user?.id && !isITUser(emp) && (
                                   <Button
                                     variant="ghost"
                                     size="sm"

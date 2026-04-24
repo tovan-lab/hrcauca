@@ -1,15 +1,43 @@
 import {
-  LayoutDashboard, Camera, Users, ClipboardList, Settings, LogOut, ChevronDown, Star, TrendingUp, MessageSquare, CalendarClock, Building2, BarChart3, HardDrive, ArrowLeftRight, Hourglass,
+  LayoutDashboard,
+  Camera,
+  Users,
+  ClipboardList,
+  Settings,
+  LogOut,
+  ChevronDown,
+  Star,
+  TrendingUp,
+  MessageSquare,
+  CalendarClock,
+  Building2,
+  BarChart3,
+  HardDrive,
+  ArrowLeftRight,
+  Hourglass,
+  KeyRound,
+  Bot,
 } from 'lucide-react';
 import { NavLink } from '@/components/NavLink';
 import { useAuth } from '@/contexts/AuthContext';
 import { UserRole } from '@/lib/types';
 import {
-  Sidebar, SidebarContent, SidebarGroup, SidebarGroupContent, SidebarGroupLabel,
-  SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarFooter, useSidebar,
+  Sidebar,
+  SidebarContent,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarFooter,
+  useSidebar,
 } from '@/components/ui/sidebar';
 import {
-  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 
@@ -32,11 +60,14 @@ const navItems: NavItem[] = [
   { title: 'Yêu cầu về sớm', url: '/early-checkout-requests', icon: Hourglass, roles: ['HR'] },
   { title: 'Báo cáo tổng hợp', url: '/employee-report', icon: BarChart3, roles: ['ADMIN', 'HR'] },
   { title: 'Cổng liên kết HR', url: '/hr-hub', icon: ArrowLeftRight, roles: ['ADMIN', 'HR'] },
-  { title: 'Quản lý lưu trữ', url: '/storage', icon: HardDrive, roles: ['ADMIN'] },
+  { title: 'Cấu hình hệ thống', url: '/system-settings', icon: Settings, roles: ['IT'] },
+  { title: 'Quản lý API', url: '/api-management', icon: KeyRound, roles: ['IT', 'HR'] },
+  { title: 'Lịch sử chat AI', url: '/chat-audit', icon: Bot, roles: ['IT'] },
+  { title: 'Quản lý lưu trữ', url: '/storage', icon: HardDrive, roles: ['IT'] },
   { title: 'Nhật ký của tôi', url: '/my-checkins', icon: ClipboardList, roles: ['EMPLOYEE'] },
   { title: 'Hiệu suất', url: '/my-performance', icon: TrendingUp, roles: ['EMPLOYEE'] },
   { title: 'Gửi phản hồi', url: '/feedback', icon: MessageSquare, roles: ['EMPLOYEE'] },
-  { title: 'Cài đặt', url: '/settings', icon: Settings, roles: ['ADMIN', 'HR', 'EMPLOYEE'] },
+  { title: 'Cài đặt', url: '/settings', icon: Settings, roles: ['ADMIN', 'HR', 'EMPLOYEE', 'IT'] },
 ];
 
 export function AppSidebar() {
@@ -46,7 +77,7 @@ export function AppSidebar() {
 
   if (!user) return null;
 
-  const visible = navItems.filter(n => n.roles.includes(user.role));
+  const visible = navItems.filter((item) => item.roles.includes(user.role));
 
   return (
     <Sidebar collapsible="icon">
@@ -54,11 +85,11 @@ export function AppSidebar() {
         <SidebarGroup>
           {!collapsed && (
             <div className="px-4 pt-4 pb-2">
-              <SidebarGroupLabel className="text-xs tracking-widest uppercase text-sidebar-foreground/50 p-0">
+              <SidebarGroupLabel className="p-0 text-xs uppercase tracking-widest text-sidebar-foreground/50">
                 Hệ thống HR
               </SidebarGroupLabel>
               {user.branch_name && (
-                <p className="text-xs text-primary mt-1 flex items-center gap-1">
+                <p className="mt-1 flex items-center gap-1 text-xs text-primary">
                   <Building2 className="h-3 w-3" />
                   {user.branch_name}
                 </p>
@@ -67,14 +98,14 @@ export function AppSidebar() {
           )}
           <SidebarGroupContent>
             <SidebarMenu>
-              {visible.map(item => (
+              {visible.map((item) => (
                 <SidebarMenuItem key={item.url}>
                   <SidebarMenuButton asChild>
                     <NavLink
                       to={item.url}
                       end
                       className="flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-sidebar-foreground/70 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-                      activeClassName="bg-sidebar-accent text-sidebar-primary font-semibold"
+                      activeClassName="bg-sidebar-accent font-semibold text-sidebar-primary"
                     >
                       <item.icon className="h-4 w-4 shrink-0" />
                       {!collapsed && <span>{item.title}</span>}
@@ -89,11 +120,14 @@ export function AppSidebar() {
 
       <SidebarFooter className="border-t border-sidebar-border p-3">
         <DropdownMenu>
-          <DropdownMenuTrigger className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-sm text-sidebar-foreground hover:bg-sidebar-accent transition-colors">
+          <DropdownMenuTrigger className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-sm text-sidebar-foreground transition-colors hover:bg-sidebar-accent">
             <Avatar className="h-8 w-8 shrink-0">
               <AvatarImage src={user.avatar} alt={user.name} />
-              <AvatarFallback className="bg-sidebar-primary text-sidebar-primary-foreground text-xs">
-                {user.name.split(' ').map(n => n[0]).join('')}
+              <AvatarFallback className="bg-sidebar-primary text-xs text-sidebar-primary-foreground">
+                {user.name
+                  .split(' ')
+                  .map((part) => part[0])
+                  .join('')}
               </AvatarFallback>
             </Avatar>
             {!collapsed && (
@@ -101,7 +135,13 @@ export function AppSidebar() {
                 <div className="flex-1 text-left">
                   <p className="font-medium leading-none">{user.name}</p>
                   <p className="mt-0.5 text-xs text-sidebar-foreground/50">
-                    {user.role === 'ADMIN' ? 'HR' : user.role === 'HR' ? 'Quản lý' : 'Nhân viên'}
+                    {user.role === 'ADMIN'
+                      ? 'HR'
+                      : user.role === 'HR'
+                        ? 'Quản lý'
+                        : user.role === 'IT'
+                          ? 'IT'
+                          : 'Nhân viên'}
                   </p>
                 </div>
                 <ChevronDown className="h-4 w-4 text-sidebar-foreground/40" />

@@ -36,7 +36,7 @@ export function ProtectedRoute({ children, roles }: Props) {
   if (!isAuthenticated || !user) return <Navigate to="/login" replace />;
   if (isPending || isInactive) return <Navigate to="/pending" replace />;
   if (!roles.includes(user.role)) {
-    const fallback = user.role === 'EMPLOYEE' ? '/check-in' : '/dashboard';
+    const fallback = user.role === 'EMPLOYEE' ? '/check-in' : user.role === 'IT' ? '/storage' : '/dashboard';
     return <Navigate to={fallback} replace />;
   }
 

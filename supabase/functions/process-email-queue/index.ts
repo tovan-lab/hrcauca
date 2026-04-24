@@ -96,6 +96,25 @@ function parseJwtClaims(token: string): Record<string, unknown> | null {
   }
 }
 
+async function getSystemApiKey(
+  supabase: ReturnType<typeof createClient>,
+  service: 'openai' | 'resend'
+): Promise<string | null> {
+  const { data, error } = await supabase
+    .from('system_api_configs')
+    .select('api_key')
+    .eq('service', service)
+    .maybeSingle()
+
+  if (error) {
+    console.error(`Failed to load ${service} api key override`, error)
+    return null
+  }
+
+  const value = data?.api_key?.trim()
+  return value ? value : null
+}
+
 // Move a message to the dead letter queue and log the reason.
 async function moveToDlq(
   supabase: ReturnType<typeof createClient>,
@@ -123,12 +142,11 @@ async function moveToDlq(
 }
 
 Deno.serve(async (req) => {
-  const resendApiKey = Deno.env.get('RESEND_API_KEY')
   const resendFrom = Deno.env.get('RESEND_FROM') // e.g. "Cau Ca <noreply@cauca.io.vn>"
   const supabaseUrl = Deno.env.get('SUPABASE_URL')
   const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')
 
-  if (!resendApiKey || !supabaseUrl || !supabaseServiceKey) {
+  if (!supabaseUrl || !supabaseServiceKey) {
     console.error('Missing required environment variables')
     return new Response(
       JSON.stringify({ error: 'Server configuration error' }),
@@ -157,6 +175,15 @@ Deno.serve(async (req) => {
   }
 
   const supabase = createClient(supabaseUrl, supabaseServiceKey)
+  const resendApiKey = (await getSystemApiKey(supabase, 'resend')) || Deno.env.get('RESEND_API_KEY')
+
+  if (!resendApiKey) {
+    console.error('Missing Resend API key in system config and environment')
+    return new Response(
+      JSON.stringify({ error: 'Server configuration error' }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
+    )
+  }
 
   // 1. Check rate-limit cooldown and read queue config
   const { data: state } = await supabase

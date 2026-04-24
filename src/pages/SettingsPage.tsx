@@ -142,7 +142,7 @@ export default function SettingsPage() {
   };
 
   const roleLabel = (r?: string) => {
-    switch (r) { case 'ADMIN': return 'HR'; case 'HR': return 'Quản lý'; default: return 'Nhân viên'; }
+    switch (r) { case 'ADMIN': return 'HR'; case 'HR': return 'Quản lý'; case 'IT': return 'IT'; default: return 'Nhân viên'; }
   };
 
   if (!user) return null;
@@ -219,7 +219,7 @@ export default function SettingsPage() {
                   </Button>
                 </div>
               )}
-              <Badge variant={user.role === 'ADMIN' ? 'destructive' : user.role === 'HR' ? 'default' : 'secondary'} className="text-xs mt-1">
+              <Badge variant={user.role === 'ADMIN' ? 'destructive' : user.role === 'HR' ? 'default' : user.role === 'IT' ? 'outline' : 'secondary'} className="text-xs mt-1">
                 {roleLabel(user.role)}
               </Badge>
               <p className="text-xs text-muted-foreground mt-1">Nhấn ảnh để đổi ảnh đại diện · biểu tượng bút để đổi tên</p>
