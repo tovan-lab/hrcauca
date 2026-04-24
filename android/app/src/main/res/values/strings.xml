@@ -1,7 +1,7 @@
 <?xml version='1.0' encoding='utf-8'?>
 <resources>
-    <string name="app_name">HR Performance System</string>
-    <string name="title_activity_main">HR Performance System</string>
+    <string name="app_name">Cậu Cả</string>
+    <string name="title_activity_main">Cậu Cả</string>
     <string name="package_name">com.hrcauca.app</string>
     <string name="custom_url_scheme">com.hrcauca.app</string>
 </resources>

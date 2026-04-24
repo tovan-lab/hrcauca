@@ -2,7 +2,7 @@ import type { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
   appId: 'com.hrcauca.app',
-  appName: 'HR Performance System',
+  appName: 'Cậu Cả',
   webDir: 'dist',
   bundledWebRuntime: false,
   server: {
