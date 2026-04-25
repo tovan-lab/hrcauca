@@ -67,12 +67,16 @@ export default function LogsPage() {
 
   const fetchData = useCallback(async () => {
     setLoading(true);
-    const today = new Date().toISOString().slice(0, 10);
+    const now = new Date();
+    const today = now.toISOString().slice(0, 10);
+    const yesterday = new Date(now);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayStr = yesterday.toISOString().slice(0, 10);
     const [{ data: cis }, { data: profs }, { data: branchList }, { data: shiftsData }] = await Promise.all([
       supabase.from('check_ins').select('*').order('check_in_time', { ascending: false }),
       supabase.from('profiles').select('user_id, name, branch_id'),
       supabase.from('branches').select('id, branch_name'),
-      supabase.from('shifts').select('id, user_id, shift_date, start_time, end_time').eq('shift_date', today),
+      supabase.from('shifts').select('id, user_id, shift_date, start_time, end_time').gte('shift_date', yesterdayStr).lte('shift_date', today),
     ]);
     if (profs) {
       const map: Record<string, string> = {};

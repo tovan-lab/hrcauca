@@ -53,11 +53,21 @@ function buildFallbackCloseTime(checkInTime: string): Date {
   return new Date(new Date(checkInTime).getTime() + 8 * 60 * 60 * 1000);
 }
 
+function buildAutoCloseTime(checkIn: Pick<TodayCheckIn, 'check_in_time' | 'scheduled_shift_date' | 'scheduled_start_time' | 'scheduled_end_time'>): Date {
+  const fallbackClose = buildFallbackCloseTime(checkIn.check_in_time);
+  if (checkIn.scheduled_shift_date && checkIn.scheduled_start_time && checkIn.scheduled_end_time) {
+    const scheduledClose = buildScheduledShiftEnd(
+      checkIn.scheduled_shift_date,
+      checkIn.scheduled_start_time,
+      checkIn.scheduled_end_time,
+    );
+    return scheduledClose > fallbackClose ? scheduledClose : fallbackClose;
+  }
+  return fallbackClose;
+}
+
 function isCheckInStillActive(checkIn: TodayCheckIn, now: Date): boolean {
-  const closeAt =
-    checkIn.scheduled_shift_date && checkIn.scheduled_start_time && checkIn.scheduled_end_time
-      ? buildScheduledShiftEnd(checkIn.scheduled_shift_date, checkIn.scheduled_start_time, checkIn.scheduled_end_time)
-      : buildFallbackCloseTime(checkIn.check_in_time);
+  const closeAt = buildAutoCloseTime(checkIn);
   return now < closeAt;
 }
 
@@ -138,10 +148,7 @@ export function CameraCheckIn({ geoAllowed = true, onRefreshLocation }: CameraCh
     let activeOpenCheckIn: TodayCheckIn | null = null;
 
     for (const ci of ((openCIs as TodayCheckIn[]) || [])) {
-      const closeAt =
-        ci.scheduled_shift_date && ci.scheduled_start_time && ci.scheduled_end_time
-          ? buildScheduledShiftEnd(ci.scheduled_shift_date, ci.scheduled_start_time, ci.scheduled_end_time)
-          : buildFallbackCloseTime(ci.check_in_time);
+      const closeAt = buildAutoCloseTime(ci);
 
       if (now >= closeAt) {
         await supabase

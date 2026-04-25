@@ -453,7 +453,10 @@ Quy tắc chung:
 - Luôn trả lời bằng tiếng Việt tự nhiên, ngắn gọn, rõ ràng.
 - Không tiết lộ SQL, API, tool name hay chi tiết kỹ thuật nội bộ.
 - Nếu có danh sách, ưu tiên markdown dễ đọc.
-- Hôm nay là ${today}.`;
+- Hôm nay là ${today}.
+- Khi người dùng hỏi về ca làm, chấm công, nhân viên chưa/không check-in, đi muộn, tổng giờ, đánh giá hoặc chi nhánh, phải dùng tool tra cứu dữ liệu trước khi trả lời.
+- Câu hỏi "ai/chưa/không checkin", "chưa chấm công", "không điểm danh", "gửi tên" sau câu hỏi thiếu check-in phải trả lời đúng số lượng và danh sách nhân viên/ca liên quan, không trả lời chung chung.
+- Nếu thiếu dữ kiện để thao tác dữ liệu, hãy hỏi đúng dữ kiện còn thiếu thay vì nói không hiểu.`;
 
   if (role === "HR") {
     return `${base}
@@ -480,7 +483,7 @@ const queryTool = {
   type: "function",
   function: {
     name: "query_hr_data",
-    description: "Tra cứu dữ liệu HR: ca làm, chấm công, đánh giá, danh sách nhân viên.",
+    description: "Tra cứu dữ liệu HR: ca làm, chấm công, nhân viên chưa check-in, đánh giá, tổng hợp tháng, danh sách nhân viên và chi nhánh.",
     parameters: {
       type: "object",
       properties: {
@@ -698,6 +701,11 @@ function hasActiveEvaluationPrompt(messages: ChatMessage[]) {
 
 function shouldUseDeterministicFallback(message: string, messages: ChatMessage[]) {
   const normalized = normalizeText(message);
+  const previousUser = previousUserMessage(messages);
+  const previousAssistant = previousAssistantMessage(messages);
+  const asksMissingCheckinNames =
+    isAttendanceNameFollowUp(message) &&
+    (isMissingCheckinIntent(previousUser) || isMissingCheckinIntent(previousAssistant));
   const refersToPriorContext =
     normalized.includes("ca do") ||
     normalized.includes("nguoi do") ||
@@ -716,43 +724,72 @@ function shouldUseDeterministicFallback(message: string, messages: ChatMessage[]
     normalized.includes("danh gia nhan vien") ||
     normalized.includes("đánh giá nhân viên");
 
-  return hasActiveEvaluationPrompt(messages) || startsEvaluation || (refersToPriorContext && mentionsMutation);
+  return (
+    hasActiveEvaluationPrompt(messages) ||
+    startsEvaluation ||
+    isMissingCheckinIntent(message) ||
+    asksMissingCheckinNames ||
+    (refersToPriorContext && mentionsMutation)
+  );
 }
 
 function isMissingCheckinIntent(message: string) {
   const normalized = normalizeText(message);
-  return (
-    normalized.includes("khong checkin") ||
-    normalized.includes("khong check-in") ||
-    normalized.includes("khong cham cong") ||
-    normalized.includes("chua checkin") ||
-    normalized.includes("chua check-in") ||
-    normalized.includes("chua cham cong")
-  );
+  const hasMissingWord =
+    normalized.includes("khong") ||
+    normalized.includes("chua") ||
+    normalized.includes("thieu") ||
+    normalized.includes("quen");
+  const hasCheckinWord =
+    normalized.includes("checkin") ||
+    normalized.includes("check-in") ||
+    normalized.includes("check in") ||
+    normalized.includes("cham cong") ||
+    normalized.includes("diem danh") ||
+    normalized.includes("vao ca");
+
+  return hasMissingWord && hasCheckinWord;
 }
 
 function isAttendanceNameFollowUp(message: string) {
   const normalized = normalizeText(message);
   return (
     normalized.includes("gui ten") ||
+    normalized.includes("gui ho ten") ||
     normalized.includes("cho toi ten") ||
+    normalized.includes("cho ten") ||
     normalized.includes("liet ke ten") ||
+    normalized.includes("liet ke") ||
     normalized.includes("gui danh sach") ||
-    normalized.includes("danh sach ten")
+    normalized.includes("danh sach ten") ||
+    normalized.includes("nhung ai") ||
+    normalized.includes("ai vay") ||
+    normalized === "ten" ||
+    normalized === "danh sach"
   );
 }
 
 function formatMissingCheckinReply(result: QueryResult, today: string, includeNames: boolean) {
-  const missingRows = (result.missing_checkin || []) as Array<{ name?: string }>;
+  const missingRows = (result.missing_checkin || []) as Array<{
+    name?: string;
+    branch?: string;
+    start?: string;
+    end?: string;
+  }>;
+  const scheduledCount = typeof result.scheduled_count === "number" ? result.scheduled_count : missingRows.length;
 
   if (missingRows.length === 0) {
     return `Hôm nay (${today}) không có nhân viên nào bị thiếu check-in trong phạm vi tra cứu.`;
   }
 
-  const lines = [`Hôm nay (${today}) có **${missingRows.length}** nhân viên chưa check-in.`];
+  const lines = [`Hôm nay (${today}) có **${missingRows.length}/${scheduledCount}** ca chưa check-in.`];
 
   if (includeNames || missingRows.length <= 10) {
-    lines.push(...missingRows.map((row, index) => `${index + 1}. ${row.name || "Không rõ"}`));
+    lines.push(...missingRows.map((row, index) => {
+      const timeRange = row.start && row.end ? ` (${row.start}-${row.end})` : "";
+      const branch = row.branch ? ` - ${row.branch}` : "";
+      return `${index + 1}. ${row.name || "Không rõ"}${timeRange}${branch}`;
+    }));
   } else {
     lines.push("Nếu cần danh sách tên, hãy nói: `gửi tên cho tôi`.");
   }
@@ -1051,7 +1088,7 @@ async function executeQuery(
   }
 
   if (queryType === "attendance") {
-    let query = supabaseAdmin.from("check_ins").select("id, user_id, check_in_time, check_out_time, attendance_status, late_minutes, branch_id");
+    let query = supabaseAdmin.from("check_ins").select("id, user_id, shift_id, check_in_time, check_out_time, attendance_status, late_minutes, branch_id");
     if (date) query = query.gte("check_in_time", `${date}T00:00:00`).lt("check_in_time", `${date}T23:59:59`);
     if (dateFrom) query = query.gte("check_in_time", `${dateFrom}T00:00:00`);
     if (dateTo) query = query.lt("check_in_time", `${dateTo}T23:59:59`);
@@ -1063,7 +1100,7 @@ async function executeQuery(
     if (effectiveDate) {
       const { data: shifts } = await supabaseAdmin
         .from("shifts")
-        .select("user_id, shift_date, start_time, end_time, actual_branch_id")
+        .select("id, user_id, shift_date, start_time, end_time, actual_branch_id")
         .eq("shift_date", effectiveDate);
       scheduledShifts = shifts || [];
     }
@@ -1089,6 +1126,7 @@ async function executeQuery(
         name: p.name || "Không rõ",
         branch: branchMap[p.branch_id] || branchMap[c.branch_id] || "Chưa phân chi nhánh",
         branch_id: p.branch_id || c.branch_id,
+        shift_id: c.shift_id,
         check_in: c.check_in_time,
         check_out: c.check_out_time,
         status: c.attendance_status,
@@ -1102,13 +1140,44 @@ async function executeQuery(
       result = result.filter((r: any) => r.name.toLowerCase().includes(lower));
     }
 
-    let missingCheckin = scheduledShifts
-      .filter((shift: any) => !(checkins || []).some((checkin: any) => checkin.user_id === shift.user_id))
+    let scheduledShiftsInScope = scheduledShifts;
+    if (callerRole === "HR" && callerBranchId) {
+      scheduledShiftsInScope = scheduledShiftsInScope.filter((shift: any) => {
+        const profile = profileMap[shift.user_id] || {};
+        return (shift.actual_branch_id || profile.branch_id || null) === callerBranchId;
+      });
+    }
+    if (branchId) {
+      scheduledShiftsInScope = scheduledShiftsInScope.filter((shift: any) => {
+        const profile = profileMap[shift.user_id] || {};
+        return (shift.actual_branch_id || profile.branch_id || null) === branchId;
+      });
+    }
+    if (employeeName) {
+      const lower = employeeName.toLowerCase();
+      scheduledShiftsInScope = scheduledShiftsInScope.filter((shift: any) => {
+        const profile = profileMap[shift.user_id] || {};
+        return String(profile.name || "").toLowerCase().includes(lower);
+      });
+    }
+
+    let missingCheckin = scheduledShiftsInScope
+      .filter((shift: any) => {
+        const matchedByShiftId = (checkins || []).some((checkin: any) => checkin.shift_id && checkin.shift_id === shift.id);
+        if (matchedByShiftId) return false;
+
+        return !(checkins || []).some((checkin: any) => {
+          if (checkin.shift_id) return false;
+          const checkinDate = typeof checkin.check_in_time === "string" ? checkin.check_in_time.slice(0, 10) : "";
+          return checkin.user_id === shift.user_id && checkinDate === shift.shift_date;
+        });
+      })
       .map((shift: any) => {
         const profile = profileMap[shift.user_id] || {};
         const resolvedBranchId = shift.actual_branch_id || profile.branch_id || null;
 
         return {
+          shift_id: shift.id,
           user_id: shift.user_id,
           name: profile.name || "Không rõ",
           branch: branchMap[resolvedBranchId] || "Chưa phân chi nhánh",
@@ -1119,12 +1188,6 @@ async function executeQuery(
         };
       });
 
-    if (callerRole === "HR" && callerBranchId) {
-      missingCheckin = missingCheckin.filter((row: any) => row.branch_id === callerBranchId);
-    }
-    if (branchId) {
-      missingCheckin = missingCheckin.filter((row: any) => row.branch_id === branchId);
-    }
     if (employeeName) {
       const lower = employeeName.toLowerCase();
       missingCheckin = missingCheckin.filter((row: any) => row.name.toLowerCase().includes(lower));
@@ -1134,7 +1197,7 @@ async function executeQuery(
       count: result.length,
       data: result,
       missing_checkin: missingCheckin,
-      scheduled_count: scheduledShifts.length,
+      scheduled_count: scheduledShiftsInScope.length,
     };
   }
 

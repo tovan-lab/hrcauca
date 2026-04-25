@@ -416,7 +416,7 @@ export function ShiftMatrixGrid() {
     const actualEnd = checkIn.check_out_time ? new Date(checkIn.check_out_time) : shiftEnd;
 
     const workStart = new Date(Math.max(shiftStart.getTime(), actualStart.getTime()));
-    const workEnd = new Date(Math.min(shiftEnd.getTime(), actualEnd.getTime()));
+    const workEnd = new Date(actualEnd.getTime());
 
     if (workEnd <= workStart) return 0;
 

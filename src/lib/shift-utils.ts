@@ -85,15 +85,17 @@ export function isOvernightShift(startTime: string, endTime: string): boolean {
 }
 
 /**
- * Calculate effective hours from actual check-in/check-out timestamps,
- * clamped within the registered shift window. This is the "actual paid hours".
+ * Calculate effective hours from actual check-in/check-out timestamps.
+ * Late check-in cuts time from the start, but late check-out is counted as
+ * actual overtime instead of being clamped to the registered shift end.
  *
  * Rules:
- * - Working window = intersection of [shiftStart, shiftEnd] and [actualCheckIn, actualCheckOut].
+ * - Working window starts at max(shiftStart, actualCheckIn).
  *   - Late check-in cuts time from the start.
+ *   - Early check-in does not add time before the registered shift.
+ * - Working window ends at actualCheckOut when present.
  *   - Early check-out cuts time from the end.
- *   - Early check-in or late check-out does NOT add extra paid time
- *     (employees are not paid for time outside the registered shift).
+ *   - Late check-out adds actual overtime worked.
  * - Night bonus 1.25x applies to the portion of the working window
  *   that falls between 00:00 and 06:00 (any calendar day).
  *
@@ -121,12 +123,12 @@ export function calcActualEffectiveHours(
     shiftEnd.setDate(shiftEnd.getDate() + 1);
   }
 
-  // Determine actual working window, clamped within the registered shift.
+  // Determine actual working window.
   const checkInDate = actualCheckIn ? new Date(actualCheckIn) : shiftStart;
   const checkOutDate = actualCheckOut ? new Date(actualCheckOut) : shiftEnd;
 
   const workStart = new Date(Math.max(shiftStart.getTime(), checkInDate.getTime()));
-  const workEnd = new Date(Math.min(shiftEnd.getTime(), checkOutDate.getTime()));
+  const workEnd = new Date(checkOutDate.getTime());
 
   if (workEnd <= workStart) {
     return { totalHours: 0, nightHours: 0, effectiveHours: 0 };

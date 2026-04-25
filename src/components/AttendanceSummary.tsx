@@ -37,41 +37,56 @@ interface IssueUser {
   severity: 'critical' | 'warning' | 'info';
 }
 
+function buildShiftWindow(shift: ShiftData) {
+  const shiftStart = new Date(`${shift.shift_date}T${shift.start_time}`);
+  const shiftEnd = new Date(`${shift.shift_date}T${shift.end_time}`);
+  if (shiftEnd <= shiftStart) {
+    shiftEnd.setDate(shiftEnd.getDate() + 1);
+  }
+  return { shiftStart, shiftEnd };
+}
+
 export default function AttendanceSummary({ shifts, checkIns, profiles, profileBranches, branches, branchFilter }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [tick, setTick] = useState(0);
+
   useEffect(() => {
     const interval = setInterval(() => setTick(t => t + 1), 60000);
     return () => clearInterval(interval);
   }, []);
+
   const today = format(new Date(), 'yyyy-MM-dd');
-  const now = new Date(); // eslint-disable-line
-
   const summary = useMemo(() => {
-    let todayShifts = shifts.filter(s => s.shift_date === today);
-    if (branchFilter !== 'all') {
-      todayShifts = todayShifts.filter(s => profileBranches[s.user_id] === branchFilter);
-    }
+    const currentTime = new Date();
+    const yesterday = new Date(currentTime);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayStr = format(yesterday, 'yyyy-MM-dd');
 
-    const registeredUsers = new Set(todayShifts.map(s => s.user_id));
-
-    const todayCheckIns = checkIns.filter(ci => {
-      const ciDate = format(new Date(ci.check_in_time), 'yyyy-MM-dd');
-      return ciDate === today;
+    let relevantShifts = shifts.filter(shift => {
+      if (shift.shift_date === today) return true;
+      if (shift.shift_date !== yesterdayStr) return false;
+      const { shiftEnd } = buildShiftWindow(shift);
+      return shiftEnd > currentTime;
     });
 
-    const checkedInUsers = new Set(todayCheckIns.map(ci => ci.user_id));
-    const checkedInShiftIds = new Set(todayCheckIns.map(ci => ci.shift_id).filter(Boolean));
+    if (branchFilter !== 'all') {
+      relevantShifts = relevantShifts.filter(shift => profileBranches[shift.user_id] === branchFilter);
+    }
 
-    // Build per-shift status with time awareness
+    const relevantShiftIds = new Set(relevantShifts.map(shift => shift.id));
+    const relevantCheckIns = checkIns.filter(checkIn => !!checkIn.shift_id && relevantShiftIds.has(checkIn.shift_id));
+    const registeredUsers = new Set(relevantShifts.map(shift => shift.user_id));
+    const checkedInUsers = new Set(relevantCheckIns.map(checkIn => checkIn.user_id));
+    const checkedInShiftIds = new Set(relevantCheckIns.map(checkIn => checkIn.shift_id).filter(Boolean));
+
     const issueUsers: IssueUser[] = [];
     let fullyDoneCount = 0;
 
     registeredUsers.forEach(uid => {
-      const userShifts = todayShifts.filter(s => s.user_id === uid);
-      const userCheckIns = todayCheckIns.filter(ci => ci.user_id === uid);
+      const userShifts = relevantShifts.filter(shift => shift.user_id === uid);
+      const userCheckIns = relevantCheckIns.filter(checkIn => checkIn.user_id === uid);
       const branchId = profileBranches[uid];
-      const branchName = branches.find(b => b.id === branchId)?.branch_name || '';
+      const branchName = branches.find(branch => branch.id === branchId)?.branch_name || '';
       const name = profiles[uid] || uid.slice(0, 8);
 
       const issues: string[] = [];
@@ -79,41 +94,34 @@ export default function AttendanceSummary({ shifts, checkIns, profiles, profileB
       let maxSeverity: 'critical' | 'warning' | 'info' = 'info';
 
       for (const shift of userShifts) {
-        const shiftStart = new Date(`${today}T${shift.start_time}`);
-        const shiftEnd = new Date(`${today}T${shift.end_time}`);
+        const { shiftStart, shiftEnd } = buildShiftWindow(shift);
         const hasCheckedIn = checkedInShiftIds.has(shift.id);
-        const matchingCI = userCheckIns.find(ci => ci.shift_id === shift.id);
-        const hasCheckedOut = matchingCI?.check_out_time != null;
+        const matchingCheckIn = userCheckIns.find(checkIn => checkIn.shift_id === shift.id);
+        const hasCheckedOut = matchingCheckIn?.check_out_time != null;
 
-        // Only flag missing check-in if shift start time has passed
-        if (!hasCheckedIn && now >= shiftStart) {
-          const minsLate = Math.floor((now.getTime() - shiftStart.getTime()) / 60000);
-          issues.push(`Chưa checkin ca ${shift.start_time.slice(0, 5)}–${shift.end_time.slice(0, 5)} (trễ ${minsLate}p)`);
+        if (!hasCheckedIn && currentTime >= shiftStart) {
+          const minsLate = Math.floor((currentTime.getTime() - shiftStart.getTime()) / 60000);
+          issues.push(`Chưa checkin ca ${shift.start_time.slice(0, 5)}-${shift.end_time.slice(0, 5)} (trễ ${minsLate}p)`);
           maxSeverity = 'critical';
           allDone = false;
-        } else if (!hasCheckedIn && now < shiftStart) {
-          // Shift hasn't started yet — not an issue
+        } else if (!hasCheckedIn && currentTime < shiftStart) {
           allDone = false;
         } else if (hasCheckedIn && !hasCheckedOut) {
-          if (now >= shiftEnd) {
-            // Shift ended but no checkout
-            const minsOver = Math.floor((now.getTime() - shiftEnd.getTime()) / 60000);
-            issues.push(`Chưa checkout ca ${shift.start_time.slice(0, 5)}–${shift.end_time.slice(0, 5)} (quá ${minsOver}p)`);
+          if (currentTime >= shiftEnd) {
+            const minsOver = Math.floor((currentTime.getTime() - shiftEnd.getTime()) / 60000);
+            issues.push(`Chưa checkout ca ${shift.start_time.slice(0, 5)}-${shift.end_time.slice(0, 5)} (quá ${minsOver}p)`);
             if (maxSeverity !== 'critical') maxSeverity = 'warning';
             allDone = false;
           } else {
-            // Still working — not done yet but not an issue
             allDone = false;
           }
         }
-        // hasCheckedIn && hasCheckedOut => this shift is complete
       }
 
       if (allDone && userShifts.length > 0 && issues.length === 0) {
-        // Check if ALL shifts actually completed (checkin + checkout)
-        const allShiftsComplete = userShifts.every(s => {
-          const ci = userCheckIns.find(c => c.shift_id === s.id);
-          return ci && ci.check_out_time;
+        const allShiftsComplete = userShifts.every(shift => {
+          const checkIn = userCheckIns.find(item => item.shift_id === shift.id);
+          return checkIn && checkIn.check_out_time;
         });
         if (allShiftsComplete) fullyDoneCount++;
       }
@@ -123,7 +131,6 @@ export default function AttendanceSummary({ shifts, checkIns, profiles, profileB
       }
     });
 
-    // Sort: critical first, then warning
     issueUsers.sort((a, b) => {
       const order = { critical: 0, warning: 1, info: 2 };
       return order[a.severity] - order[b.severity];
@@ -131,7 +138,7 @@ export default function AttendanceSummary({ shifts, checkIns, profiles, profileB
 
     return {
       totalRegistered: registeredUsers.size,
-      totalShifts: todayShifts.length,
+      totalShifts: relevantShifts.length,
       checkedInCount: [...registeredUsers].filter(uid => checkedInUsers.has(uid)).length,
       fullyDone: fullyDoneCount,
       issueUsers,
@@ -139,8 +146,8 @@ export default function AttendanceSummary({ shifts, checkIns, profiles, profileB
   }, [shifts, checkIns, profiles, profileBranches, branches, branchFilter, today, tick]);
 
   const hasIssues = summary.issueUsers.length > 0;
-  const criticalCount = summary.issueUsers.filter(u => u.severity === 'critical').length;
-  const warningCount = summary.issueUsers.filter(u => u.severity === 'warning').length;
+  const criticalCount = summary.issueUsers.filter(user => user.severity === 'critical').length;
+  const warningCount = summary.issueUsers.filter(user => user.severity === 'warning').length;
 
   return (
     <Card className={`border-primary/20 ${hasIssues ? 'bg-destructive/5 border-destructive/20' : 'bg-primary/5'}`}>
@@ -218,20 +225,20 @@ export default function AttendanceSummary({ shifts, checkIns, profiles, profileB
 
         {expanded && hasIssues && (
           <div className="mt-3 pt-3 border-t border-border/50 space-y-3">
-            {summary.issueUsers.map(u => (
-              <div key={u.userId} className="flex flex-col gap-1">
+            {summary.issueUsers.map(user => (
+              <div key={user.userId} className="flex flex-col gap-1">
                 <div className="flex items-center gap-2">
-                  <span className={`text-xs font-semibold ${u.severity === 'critical' ? 'text-destructive' : 'text-amber-600'}`}>
-                    {u.severity === 'critical' ? '🚫' : '⚠️'} {u.name}
+                  <span className={`text-xs font-semibold ${user.severity === 'critical' ? 'text-destructive' : 'text-amber-600'}`}>
+                    {user.severity === 'critical' ? '🚫' : '⚠️'} {user.name}
                   </span>
-                  {u.branch && <span className="text-[10px] text-muted-foreground">({u.branch})</span>}
+                  {user.branch && <span className="text-[10px] text-muted-foreground">({user.branch})</span>}
                 </div>
                 <div className="flex flex-wrap gap-1 pl-4">
-                  {u.issues.map((issue, i) => (
+                  {user.issues.map((issue, index) => (
                     <Badge
-                      key={i}
+                      key={index}
                       variant="outline"
-                      className={`text-[11px] ${u.severity === 'critical' ? 'border-destructive/30 text-destructive' : 'border-amber-500/30 text-amber-600'}`}
+                      className={`text-[11px] ${user.severity === 'critical' ? 'border-destructive/30 text-destructive' : 'border-amber-500/30 text-amber-600'}`}
                     >
                       {issue}
                     </Badge>
