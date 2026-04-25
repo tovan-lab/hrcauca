@@ -464,6 +464,8 @@ Quy tắc chung:
 Vai trò của bạn: QUẢN LÝ CHI NHÁNH.
 - Có thể truy vấn thông tin trong hệ thống liên quan đến ca làm, chấm công, đánh giá, nhân sự và chi nhánh của mình.
 - Có thể xếp ca, thêm ca, hủy ca cho nhân viên thuộc chi nhánh mình quản lý.
+- Chỉ trả dữ liệu và chỉ thao tác với nhân viên thuộc chi nhánh của mình.
+- Nếu yêu cầu liên quan nhân viên/chi nhánh ngoài phạm vi, hãy từ chối ngắn gọn và nêu rõ giới hạn quyền.
 - Với mọi yêu cầu thay đổi ca làm, phải tóm tắt hành động trước và kết thúc bằng đúng câu:
 "Bạn có muốn xác nhận thay đổi này không?"
 - Chỉ thực hiện mutation sau khi người dùng xác nhận.
@@ -706,6 +708,9 @@ function shouldUseDeterministicFallback(message: string, messages: ChatMessage[]
   const asksMissingCheckinNames =
     isAttendanceNameFollowUp(message) &&
     (isMissingCheckinIntent(previousUser) || isMissingCheckinIntent(previousAssistant));
+  const asksShiftNames =
+    isNameListFollowUp(message) &&
+    (isShiftCountIntent(previousUser) || previousAssistantMentionsShiftCount(previousAssistant));
   const refersToPriorContext =
     normalized.includes("ca do") ||
     normalized.includes("nguoi do") ||
@@ -729,7 +734,30 @@ function shouldUseDeterministicFallback(message: string, messages: ChatMessage[]
     startsEvaluation ||
     isMissingCheckinIntent(message) ||
     asksMissingCheckinNames ||
+    asksShiftNames ||
     (refersToPriorContext && mentionsMutation)
+  );
+}
+
+function isShiftCountIntent(message: string) {
+  const normalized = normalizeText(message);
+  return (
+    normalized.includes("bao nhieu") &&
+    (
+      normalized.includes("nguoi lam") ||
+      normalized.includes("nhan vien lam") ||
+      normalized.includes("co ca lam") ||
+      normalized.includes("di lam")
+    )
+  );
+}
+
+function previousAssistantMentionsShiftCount(message: string) {
+  const normalized = normalizeText(message);
+  return (
+    normalized.includes("nguoi co ca lam") ||
+    normalized.includes("nhan vien co ca lam") ||
+    normalized.includes("ca phu hop")
   );
 }
 
@@ -752,21 +780,48 @@ function isMissingCheckinIntent(message: string) {
 }
 
 function isAttendanceNameFollowUp(message: string) {
+  return isNameListFollowUp(message);
+}
+
+function isNameListFollowUp(message: string) {
   const normalized = normalizeText(message);
   return (
+    normalized.includes("ten") ||
+    normalized.includes("ho ten") ||
     normalized.includes("gui ten") ||
     normalized.includes("gui ho ten") ||
     normalized.includes("cho toi ten") ||
+    normalized.includes("cho toi biet ten") ||
+    normalized.includes("cho biet ten") ||
     normalized.includes("cho ten") ||
     normalized.includes("liet ke ten") ||
     normalized.includes("liet ke") ||
     normalized.includes("gui danh sach") ||
     normalized.includes("danh sach ten") ||
+    normalized.includes("danh sach") ||
     normalized.includes("nhung ai") ||
     normalized.includes("ai vay") ||
+    normalized.includes("may nguoi do") ||
+    normalized.includes("nhan vien do") ||
+    normalized.includes("2 nhan vien do") ||
     normalized === "ten" ||
     normalized === "danh sach"
   );
+}
+
+function formatShiftListReply(result: QueryResult, today: string) {
+  const rows = result.data || [];
+  if (rows.length === 0) {
+    return `Hôm nay (${today}) chưa có nhân viên nào có ca làm trong phạm vi bạn được xem.`;
+  }
+
+  return [
+    `Hôm nay (${today}) có **${rows.length}** người có ca làm:`,
+    ...rows.slice(0, 30).map((row: any, index: number) => {
+      const branch = row.branch ? ` - ${row.branch}` : "";
+      return `${index + 1}. **${row.name || "Không rõ"}** (${row.start || "?"}-${row.end || "?"})${branch}`;
+    }),
+  ].join("\n");
 }
 
 function formatMissingCheckinReply(result: QueryResult, today: string, includeNames: boolean) {
@@ -1264,7 +1319,18 @@ async function executeQuery(
       counts.set(profile.branch_id, (counts.get(profile.branch_id) || 0) + 1);
     }
 
-    let result = (branchList || []).map((branch: any) => ({
+    let visibleBranches = branchList || [];
+    if (callerRole === "HR" && callerBranchId) {
+      visibleBranches = visibleBranches.filter((branch: any) => branch.id === callerBranchId);
+    }
+    if (branchId) {
+      visibleBranches = visibleBranches.filter((branch: any) => {
+        if (callerRole === "HR" && callerBranchId) return branch.id === callerBranchId && branch.id === branchId;
+        return branch.id === branchId;
+      });
+    }
+
+    let result = visibleBranches.map((branch: any) => ({
       id: branch.id,
       branch_name: branch.branch_name,
       employee_count: counts.get(branch.id) || 0,
@@ -1930,8 +1996,12 @@ function buildSummaryReplyFromQuery(message: string, result: QueryResult, today:
     return lines.join("\n");
   }
 
-  if (normalized.includes("bao nhieu") && (normalized.includes("nguoi lam") || normalized.includes("người làm"))) {
-    return `Hôm nay (${today}) có **${result.count || 0}** người có ca làm.`;
+  if (isShiftCountIntent(message)) {
+    return `Hôm nay (${today}) có **${result.count || 0}** người có ca làm. Nếu cần tên và giờ ca, hãy nói: \`gửi tên cho tôi\`.`;
+  }
+
+  if (isNameListFollowUp(message) && rows.length > 0 && rows.some((row: any) => row.start && row.end)) {
+    return formatShiftListReply(result, today);
   }
 
   if ((normalized.includes("ca") || normalized.includes("lich") || normalized.includes("lịch")) && rows.length > 0) {
@@ -2002,7 +2072,7 @@ function inferFallbackIntent(message: string, role: string, today: string): { qu
     return { reply: "Bạn không có quyền thực hiện thay đổi dữ liệu." };
   }
 
-  if (normalized.includes("bao nhieu") && (normalized.includes("nguoi lam") || normalized.includes("người làm"))) {
+  if (isShiftCountIntent(message)) {
     return { queryArgs: { query_type: "shifts", date: today } };
   }
 
@@ -2317,6 +2387,27 @@ async function handleFallback(
   const asksMissingCheckinNames =
     isAttendanceNameFollowUp(message) &&
     (isMissingCheckinIntent(previousUser) || isMissingCheckinIntent(previousAssistant));
+  const asksShiftNames =
+    isNameListFollowUp(message) &&
+    (isShiftCountIntent(previousUser) || previousAssistantMentionsShiftCount(previousAssistant));
+
+  if (asksShiftNames) {
+    const shiftResult = await executeQuery(
+      { query_type: "shifts", date: today },
+      supabaseAdmin,
+      callerBranchId,
+      role,
+    );
+
+    if (shiftResult.error) {
+      return { reply: shiftResult.error, mutations: false };
+    }
+
+    return {
+      reply: formatShiftListReply(shiftResult, today),
+      mutations: false,
+    };
+  }
 
   if (asksMissingCheckinNames) {
     const attendanceResult = await executeQuery(
